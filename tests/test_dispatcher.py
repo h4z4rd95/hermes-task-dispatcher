@@ -81,14 +81,18 @@ class FakeWorkspace:
 
 
 class FakeControl:
-    def __init__(self, *, outcomes: list[dict[str, Any]] | None = None):
+    def __init__(self, *, outcomes: list[dict[str, Any]] | None = None,
+                 fail_sync: bool = False):
         self.synced = 0
         self.pushed = 0
         self.written: list[dict[str, Any]] = outcomes if outcomes is not None else []
         self.head = "3e0652c4937d626f32241d0eebddcf64f26c759d"
+        self.fail_sync = fail_sync
 
     def sync(self) -> str:
         self.synced += 1
+        if self.fail_sync:
+            raise RuntimeError("simulated control sync failure")
         return self.head
 
     def push(self) -> None:
@@ -353,3 +357,21 @@ def test_tick_does_not_raise_on_bad_inbox(env):
     report = d.tick()
     assert report.errors
     assert report.claimed == []
+
+
+def test_tick_aborts_when_control_sync_fails(env):
+    """A failed control-repo sync must fail the tick, not dispatch on a
+    possibly-stale inbox (T-2026-10-05-DISPATCHER-CRON-SYNC-001)."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-1", title="Smoke", prompt_inline="Reply PONG",
+                                session="smoke-1")])
+    failing = FakeControl(fail_sync=True)
+    d_bad = Dispatcher(cfg, store=store, router=router, workspace=workspace,
+                       control=failing)
+    report = d_bad.tick()
+    assert any("control sync failed" in e for e in report.errors)
+    assert report.claimed == []
+    assert report.completed == []
+    assert router.calls == []  # nothing dispatched on the stale inbox
+    assert failing.pushed == 0
+    assert store.get("T-1") is None or store.get("T-1").status != "RUNNING"

@@ -166,8 +166,16 @@ class Dispatcher:
             head = self.control.sync()
             self.log("debug", f"control repo at {head[:12]}")
         except Exception as exc:
+            # A failed sync means the local inbox may be stale. Dispatching on
+            # stale state is the silent-failure mode the permanent dispatcher
+            # must not have (T-2026-10-05-DISPATCHER-CRON-SYNC-001): fail the
+            # tick loudly instead of continuing with a possibly outdated inbox.
             report.errors.append(f"control sync failed: {exc}")
-            self.log("warn", f"control sync failed: {exc} — continuing with local inbox")
+            self.log(
+                "error",
+                f"control sync failed: {exc} — aborting tick (no dispatch on stale inbox)",
+            )
+            return report
 
         inbox: Inbox
         try:
