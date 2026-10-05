@@ -376,6 +376,34 @@ class TestReclaim:
         assert kept.is_dir()
         assert len(manager.report()) == 1
 
+    def test_auto_reclaim_frees_space_before_failing(self, manager: WorkspaceManager, pool: Path):
+        """When the pool is short on space, checkout reclaims first, then clones.
+
+        This is the guard that keeps the dispatcher self-sustaining on a
+        bounded volume: a full pool must not wedge the scheduler when there
+        are RECLAIM-policy checkouts available to drop.
+        """
+        # A released checkout occupies pool space.
+        released = manager.checkout(task_id="T-001", repo=REPO, branch=BRANCH).path
+        assert released.is_dir()
+        repo_size = manager.repo_size_bytes(REPO) or 0
+
+        # Simulate a pool that is too small until the released checkout is gone.
+        real_free = manager.pool_free_bytes()
+
+        def fake_free():
+            if released.is_dir():
+                # Not enough while the released checkout still occupies space.
+                return max(1024, repo_size - 1024)
+            return real_free
+
+        manager.pool_free_bytes = fake_free  # type: ignore[method-assign]
+
+        out = manager.checkout(task_id="T-002", repo=REPO, branch=BRANCH)
+        assert out.created is True
+        assert not released.exists(), "auto-reclaim should have freed the released checkout"
+        assert len(manager.report()) == 1
+
     def test_reclaim_never_touches_unmanaged(self, manager: WorkspaceManager, pool: Path):
         stray = pool / "unmanaged-project"
         stray.mkdir()

@@ -94,8 +94,24 @@ class FakeControl:
     def push(self) -> None:
         self.pushed += 1
 
-    def write_outcome_from_inbox(self, inbox, report) -> str:
-        self.written.append({"tasks": [t.id for t in inbox.tasks]})
+    def write_outcome(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        summary: str,
+        evidence,
+        commit_sha: str | None = None,
+    ) -> str | None:
+        self.written.append(
+            {
+                "task_id": task_id,
+                "status": status,
+                "summary": summary,
+                "evidence": list(evidence) if evidence else [],
+                "commit_sha": commit_sha,
+            }
+        )
         return "outcome-commit-sha"
 
     def commit_all(self, message: str) -> str:

@@ -462,6 +462,18 @@ class WorkspaceManager:
             )
         free_bytes = self.pool_free_bytes()
         if free_bytes < size_bytes:
+            # Try to make room before failing: reclaim checkouts whose policy
+            # is RECLAIM. This keeps the dispatcher self-sustaining on a
+            # bounded volume; it never touches paths absent from metadata.
+            reclaimed = self.reclaim(dry_run=False)
+            freed = reclaimed.get("freed_bytes", 0)
+            if freed:
+                self._log.info(
+                    "auto-reclaimed %.1f MiB (%d checkouts) for %s",
+                    freed / MB, len(reclaimed.get("would_delete", [])), repo,
+                )
+                free_bytes = self.pool_free_bytes()
+        if free_bytes < size_bytes:
             raise WorkspaceSpaceError(
                 f"pool has {free_bytes / MB:.1f} MiB free but {repo} needs "
                 f"{size_bytes / MB:.1f} MiB"

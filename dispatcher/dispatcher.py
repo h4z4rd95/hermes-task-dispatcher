@@ -426,7 +426,26 @@ class Dispatcher:
         if not changed:
             return None
         try:
-            return self.control.write_outcome_from_inbox(inbox, report)
+            sha: str | None = None
+            for task in inbox.tasks:
+                state = states.get(task.id)
+                if state is None:
+                    continue
+                if state.status not in ("DONE", "FAILED", "CANCELLED"):
+                    continue
+                # NOTE: the loop above already copied state.status onto
+                # task.status, so do not re-compare the two here — that would
+                # skip every task this method was asked to report.
+                got = self.control.write_outcome(
+                    task_id=task.id,
+                    status=state.status,
+                    summary=state.outcome_summary or "",
+                    evidence=(),
+                    commit_sha=state.commit_sha or "",
+                )
+                if got:
+                    sha = got
+            return sha
         except AttributeError:
             # Older ControlRepo shape: fall back to a plain commit.
             return self.control.commit_all("docs(dispatcher): record task outcomes")
