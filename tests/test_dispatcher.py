@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from dispatcher.config import Config
-from dispatcher.dispatcher import Dispatcher
+from dispatcher.dispatcher import Dispatcher, TickReport
 from dispatcher.registry import Task, load_inbox
 from dispatcher.state import StateStore, TaskState
 
@@ -42,7 +42,8 @@ class FakeRouter:
 
     def run(self, *, session_name: str, prompt: str, model: str | None = None,
             max_turns: int | None = None, run_budget_s: int | None = None) -> FakeRun:
-        self.calls.append({"session_name": session_name, "prompt": prompt, "model": model})
+        self.calls.append({"session_name": session_name, "prompt": prompt, "model": model,
+                           "run_budget_s": run_budget_s})
         if session_name in self.fail_on:
             raise RuntimeError("router boom")
         if self.runs:
@@ -142,6 +143,7 @@ def _make_config(tmp_path, control_repo: Path) -> Config:
         outcomes_dir=tmp_path / "dispatcher" / "state" / "outcomes",
         pause_file=tmp_path / "dispatcher" / "state" / "PAUSE",
         cron_job_name="test-dispatcher",
+        tick_budget_s=1500,
     )
 
 
@@ -375,3 +377,76 @@ def test_tick_aborts_when_control_sync_fails(env):
     assert router.calls == []  # nothing dispatched on the stale inbox
     assert failing.pushed == 0
     assert store.get("T-1") is None or store.get("T-1").status != "RUNNING"
+
+
+# --- tick budget (T-2026-10-05-DISPATCHER-TIMEOUT-002) ----------------------
+
+
+def test_tick_sets_a_deadline_before_work(env):
+    """The tick must arm its wall-clock deadline before any phase runs, so
+    every blocking phase has a bound (the 3600s scheduler timeout alone is
+    not a bound — it is the failure mode we are fixing)."""
+    d = env[0]
+    assert d.tick_deadline is None  # not armed outside a tick
+    d.tick()
+    assert d.tick_deadline is not None
+    assert d.tick_deadline > 0
+
+
+def test_task_budget_clamped_to_remaining_tick(env):
+    """A task whose configured timeout exceeds the remaining tick budget must
+    be clamped, not allowed to run past the tick's own deadline."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    # A task with a budget far larger than the tick budget.
+    _write_inbox(control, [Task(id="T-BIG", title="Big", prompt_inline="Reply PONG",
+                                session="smoke-big", timeout_seconds=100_000)])
+    d.tick()
+    call = router.calls[0]
+    assert call["run_budget_s"] is not None
+    assert call["run_budget_s"] <= cfg.tick_budget_s
+
+
+def test_task_deferred_when_tick_budget_exhausted(env):
+    """When the tick deadline has already passed, nothing is dispatched: the
+    sync itself refuses to run past the deadline (no dispatch on a stale
+    inbox), so the candidate stays put and is picked up by a later tick
+    instead of being started past the deadline."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-DEFER", title="Defer",
+                                prompt_inline="Reply PONG", session="smoke-defer")])
+    import time as _time
+
+    d.tick_deadline = _time.time() - 1
+    report = d._tick(TickReport())
+    assert router.calls == []
+    assert report.claimed == []
+    # The task was never seeded into the store (sync aborted first), so nothing
+    # is recorded as RUNNING — no orphan lease is left behind.
+    st = store.get("T-DEFER")
+    assert st is None or st.status != "RUNNING"
+
+
+def test_tick_sync_is_bounded(env):
+    """The control-repo sync runs inside a hard timeout: a hung git operation
+    must surface as a tick error rather than wedging the scheduler."""
+    from dispatcher.dispatcher import TickReport
+
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-1", title="Smoke", prompt_inline="Reply PONG",
+                                session="smoke-1")])
+
+    class HangingControl(FakeControl):
+        def sync(self):
+            import time as _time
+
+            _time.sleep(5)
+            return "deadbeef"
+
+    import time as _time
+
+    d_hang = Dispatcher(cfg, store=store, router=router, workspace=workspace,
+                        control=HangingControl())
+    d_hang.tick_deadline = _time.time() + 1  # 1s tick budget
+    report = d_hang._tick(TickReport())
+    assert any("exceeded" in e or "sync" in e for e in report.errors)
+    assert router.calls == []

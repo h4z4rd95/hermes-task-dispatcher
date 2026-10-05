@@ -102,6 +102,12 @@ def _cmd_tick() -> int:
     for err in report.errors:
         _log("warn", f"  error: {err}")
     # A failed task must not fail the scheduler; only tick-level failures do.
+    # But a tick that overran its own budget is a tick-level failure: it means
+    # the scheduler's timeout was the only thing that stopped us, which is
+    # exactly the silent wedge we must surface as a real incident.
+    if duration > cfg.tick_budget_s:
+        _log("error", f"tick overran budget: {duration:.1f}s > {cfg.tick_budget_s}s")
+        return 3
     return 0
 
 

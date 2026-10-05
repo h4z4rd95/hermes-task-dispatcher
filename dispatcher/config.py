@@ -46,6 +46,12 @@ class Config:
     stale_lease_seconds: int
     worker_spawn: bool
 
+    # Hard wall-clock ceiling for one tick, in seconds. A tick must never
+    # approach the cron scheduler's own script timeout (3600s); this budget is
+    # enforced between tick phases so one slow phase cannot starve the
+    # scheduler or turn a 5-minute poll into an hour-long hang.
+    tick_budget_s: int
+
     # Kill switch: presence pauses all dispatch.
     pause_file: Path
 
@@ -133,12 +139,17 @@ def config() -> Config:
         outcomes_rel=Path("hermes") / "dispatch_outcomes.jsonl",
         poll_interval=os.environ.get("DISPATCHER_POLL_INTERVAL", "5m"),
         max_concurrent=int(os.environ.get("DISPATCHER_MAX_CONCURRENT", "2")),
+        # Ceiling for one tick (default 1500s, env-overridable). Chosen well
+        # below the cron scheduler's 3600s script timeout and below the 5-minute
+        # recurring interval times the number of missed fires the scheduler may
+        # catch up in sequence, so a tick can never wedge the scheduler.
+        tick_budget_s=int(os.environ.get("DISPATCHER_TICK_BUDGET_S", "1500")),
         global_workspace_quota_mb=int(os.environ.get("DISPATCHER_WORKSPACE_QUOTA_MB", "20480")),
         stale_lease_seconds=int(os.environ.get("DISPATCHER_STALE_LEASE_SECONDS", "900")),
         worker_spawn=_env_flag("DISPATCHER_WORKER_SPAWN", default=True),
-        state_dir=state_dir,
-        state_db=state_dir / "dispatcher.sqlite",
-        outcomes_dir=state_dir / "outcomes",
-        pause_file=home / "state" / "PAUSE",
+        state_dir = state_dir,
+        state_db = state_dir / "dispatcher.sqlite",
+        outcomes_dir = state_dir / "outcomes",
+        pause_file = home / "state" / "PAUSE",
         cron_job_name=os.environ.get("DISPATCHER_CRON_JOB_NAME", "hermes-task-dispatcher"),
     )

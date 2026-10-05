@@ -27,9 +27,26 @@ fi
 
 cd "$DISPATCHER_HOME"
 
+# Outermost guard: no tick may hang. The in-process budget
+# (DISPATCHER_TICK_BUDGET_S, default 1500s) is the primary bound, but a
+# subprocess wedged in the OS (a hung git/child handle, a blocked C-level
+# read) can outlive a Python-level timeout. This `timeout` is the last-resort
+# hard wall strictly below the cron scheduler's own 3600s script timeout, so
+# the scheduler kills the tick itself instead of the run timing out.
+TICK_HARD_CEILING="${DISPATCHER_TICK_CEILING_S:-1740}"
+
 PY="${DISPATCHER_PYTHON:-python}"
-"$PY" -m dispatcher.cli tick
+if command -v timeout >/dev/null 2>&1; then
+  timeout -s KILL "$TICK_HARD_CEILING" "$PY" -m dispatcher.cli tick
+else
+  "$PY" -m dispatcher.cli tick
+fi
 status=$?
+
+if [ "$status" -eq 137 ] || [ "$status" -eq 124 ]; then
+  echo "dispatcher tick FAILED: killed by hard ceiling ${TICK_HARD_CEILING}s" >&2
+  exit 124
+fi
 
 if [ "$status" -ne 0 ]; then
   echo "dispatcher tick failed with status $status" >&2

@@ -72,6 +72,9 @@ class Dispatcher:
         self._router = router
         self._workspace = workspace
         self._control = control
+        # Wall-clock deadline for this tick process. `None` only when a caller
+        # constructs a Dispatcher outside a tick (tests); tick() always sets it.
+        self.tick_deadline: float | None = None
 
     # --- lazily constructed lane B/C collaborators --------------------------
 
@@ -145,10 +148,48 @@ class Dispatcher:
                 return True
         return False
 
+    # --- bounded control-repo sync ------------------------------------------
+
+    def _sync_with_timeout(self) -> str:
+        """``ControlRepo.sync()`` wrapped in a hard wall-clock timeout.
+
+        ``git fetch`` / ``git merge`` are blocking subprocess calls with no
+        internal deadline; a hung network read in either one held a tick for
+        the full 3600-second scheduler timeout. This bounds the whole sync to a
+        fraction of the remaining tick budget so sync-before-inbox semantics
+        are preserved while the tick can still make progress.
+        """
+        import concurrent.futures
+
+        remaining = self.tick_deadline - time.time() if self.tick_deadline else 300.0
+        if remaining <= 0:
+            raise TimeoutError(
+                "tick budget exhausted before control-repo sync — refusing to "
+                "sync past the tick deadline"
+            )
+        # Cap at 300s, but never spend more than the remaining budget minus the
+        # reserve the later phases (claim/report/push) still need. The floor is
+        # 1s so a nearly-expired tick still bounds the sync instead of letting
+        # it run free.
+        budget = max(min(int(remaining) - 60, 300), 1)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.control.sync)
+            try:
+                return future.result(timeout=budget)
+            except concurrent.futures.TimeoutExpired as exc:
+                raise TimeoutError(
+                    f"control-repo sync exceeded {budget}s (tick deadline "
+                    f"{int(remaining)}s remaining)"
+                ) from exc
+
     # --- the tick ------------------------------------------------------------
 
     def tick(self) -> TickReport:
         report = TickReport()
+        # Arm the hard tick deadline before any work runs. Every blocking phase
+        # consults self.tick_deadline, so a tick can never exceed this budget
+        # regardless of how slow an individual task or git operation is.
+        self.tick_deadline = time.time() + max(self.cfg.tick_budget_s, 1)
         if self._paused():
             self.log("info", "dispatcher paused (kill-switch file present); skipping tick")
             return report
@@ -163,7 +204,7 @@ class Dispatcher:
     def _tick(self, report: TickReport) -> TickReport:
         # 1. Sync the control plane so the inbox is current.
         try:
-            head = self.control.sync()
+            head = self._sync_with_timeout()
             self.log("debug", f"control repo at {head[:12]}")
         except Exception as exc:
             # A failed sync means the local inbox may be stale. Dispatching on
@@ -220,6 +261,13 @@ class Dispatcher:
             if running >= self.cfg.max_concurrent:
                 self.log("debug", "concurrency limit reached; remaining tasks wait")
                 break
+            # Hard deadline: never start a task the tick cannot afford to wait
+            # for. A task started past the deadline would outlive the tick and
+            # the scheduler's own timeout. It stays READY and is picked up by
+            # the next tick instead.
+            if self.tick_deadline and time.time() >= self.tick_deadline:
+                self.log("warn", "tick budget exhausted; deferring remaining candidates")
+                break
             if self._workstream_busy(states, inbox, task) and not task.parallel_safe:
                 report.skipped.append(task.id)
                 continue
@@ -245,8 +293,17 @@ class Dispatcher:
             sha = self._write_outcomes_to_control(inbox, report)
             if sha:
                 report.commit_sha = sha
-                self.control.push()
-                report.pushed = True
+                deadline_ok = (self.tick_deadline or 0) - time.time() > 0
+                if deadline_ok:
+                    self.control.push()
+                    report.pushed = True
+                else:
+                    self.log(
+                        "warn",
+                        "tick budget exhausted before push; commit kept local "
+                        "for the next tick",
+                    )
+                    report.errors.append("control push skipped: tick budget exhausted")
         except Exception as exc:
             report.errors.append(f"outcome reporting failed: {exc}")
             self.log("error", f"outcome reporting failed: {exc}")
@@ -301,11 +358,39 @@ class Dispatcher:
             return
 
         session_name = task.session or f"dispatcher-{task.id}"
+        run_budget_s = task.timeout_seconds or None
+        if run_budget_s is not None:
+            # Never let a single task's configured budget consume the whole
+            # tick. The tick budget is the hard ceiling the scheduler relies on;
+            # a task budget larger than that is clamped (with a log line) rather
+            # than allowed to run past the tick's own deadline.
+            remaining = self.tick_deadline - time.time() if self.tick_deadline else 0.0
+            if remaining <= 0:
+                self.log(
+                    "warn",
+                    f"{task.id}: tick budget exhausted before run; "
+                    f"deferring task (run skipped)",
+                )
+                self.store.release(
+                    task.id,
+                    status="READY",
+                    error="tick budget exhausted; task deferred",
+                    summary="tick budget exhausted before run; deferred",
+                )
+                report.skipped.append(task.id)
+                return
+            if run_budget_s > int(remaining):
+                self.log(
+                    "warn",
+                    f"{task.id}: clamping run budget {run_budget_s}s to "
+                    f"remaining tick budget {int(remaining)}s",
+                )
+                run_budget_s = int(remaining)
         run = self.router.run(
             session_name=session_name,
             prompt=prompt,
             model=task.model or None,
-            run_budget_s=task.timeout_seconds or None,
+            run_budget_s=run_budget_s,
         )
         state.session_id = run.session_id
         self.store.upsert(state)

@@ -261,11 +261,15 @@ def test_run_budget_passed_as_timeout_and_handled():
     assert "in-flight output" in res.stdout
 
 
-def test_timeout_absent_without_budget():
+def test_run_without_budget_still_bounded():
+    # A run with no explicit budget must never be unbounded — that is how a
+    # session hang once consumed the full 3600s scheduler timeout. The router
+    # installs a safety net instead of passing timeout=None.
     runner = FakeRunner(stdout=RESUME_STDOUT)
     router = make_router(runner)
     router.run(session_name="smoke-1", prompt="hi")
-    assert runner.timeouts[0] is None
+    assert runner.timeouts[0] is not None
+    assert runner.timeouts[0] > 0
 
 
 # ---------------------------------------------------------------------- #

@@ -298,6 +298,12 @@ class SessionRouter:
         _PROMPT_HOLDER[0] = prompt
         started = time.monotonic()
         timed_out = False
+        # Never run unbounded, even if the caller passed no budget: a session
+        # with no ceiling can hang on a network read and wedge the whole
+        # scheduler (observed 3600s timeout). Two minutes is the safety net; a
+        # caller that wants longer passes an explicit budget.
+        if run_budget_s is None:
+            run_budget_s = 120
         try:
             try:
                 proc = self._runner(  # noqa: S603
