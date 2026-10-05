@@ -1,0 +1,7 @@
+# Generated
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime state — never committed
+state/
