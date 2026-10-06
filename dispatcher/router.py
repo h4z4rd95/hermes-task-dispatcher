@@ -37,6 +37,36 @@ __all__ = ["RunResult", "SessionRouter", "RouterError", "HERMES_BIN"]
 # The entrypoint resolved on this host from ``which hermes``.
 HERMES_BIN = shutil.which("hermes") or "hermes"
 
+# ``--format text`` support cache. None = not probed yet. The probe is a
+# ``--help`` parse (no side effects, no network); the result is per-process.
+_FORMAT_TEXT_SUPPORTED: bool | None = None
+
+
+def _set_format_text_supported(value: bool | None) -> None:
+    """Test seam: pin the probe result so tests do not shell out."""
+    global _FORMAT_TEXT_SUPPORTED  # noqa: PLW0603 — intentional test seam
+    _FORMAT_TEXT_SUPPORTED = value
+
+
+def _cli_supports_format_text(hermes_bin: str) -> bool:
+    """Whether the installed Hermes CLI accepts ``chat --format``.
+
+    Probed with ``chat --help`` (read-only, no session created). Older builds
+    print usage to stderr and exit 2 on the unrecognised flag; argparse exits
+    2 *before* any prompt is read, which a caller can only distinguish from a
+    real task failure by checking the usage banner.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 — argv list, never a shell string
+            [hermes_bin, "chat", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and "--format" in (proc.stdout or "")
+
 # Preamble markers, taken verbatim from verified runs on this host.
 _RESUMED_MARKER = "Resumed session"
 _FRESH_MARKER = "Starting fresh"
@@ -371,9 +401,18 @@ class SessionRouter:
             "--continue", session_name,
             "--create-if-missing",
             "-Q",
-            "--format", "text",
-            "--query-file", "-",
         ]
+        # ``--format text`` exists only on Hermes >= 0.21.5 (upstream 158fd638).
+        # The server runtime at takeover is 0.21.3 (40f2702b); emitting the flag
+        # there dies in argparse before the task ever runs, which is how a
+        # pre-execution CLI error came to be recorded as a task FAILED.
+        # It is a pure output-preference flag, so probe once per process and
+        # skip it when the installed CLI does not accept it.
+        if _FORMAT_TEXT_SUPPORTED is None:
+            _set_format_text_supported(_cli_supports_format_text(self._bin))
+        if _FORMAT_TEXT_SUPPORTED:
+            cmd += ["--format", "text"]
+        cmd += ["--query-file", "-"]
         if self.workdir is not None:
             cmd += ["--in", str(self.workdir)]
         if model:
