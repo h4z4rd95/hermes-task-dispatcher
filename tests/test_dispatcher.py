@@ -426,6 +426,30 @@ def test_task_deferred_when_tick_budget_exhausted(env):
     assert st is None or st.status != "RUNNING"
 
 
+def test_tick_always_pushes_outcome(env):
+    """An outcome commit must be pushed in the same tick. Skipping the push to
+    conserve tick budget leaves a local-only commit, and the next tick's
+    ff-only merge then fails on the diverged history — wedging every later
+    sync and blinding the inbox to all remote tasks (observed 2026-10-06)."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-PUSH", title="Push", prompt_inline="Reply PONG",
+                                session="smoke-push")])
+    report = d.tick()
+    assert report.pushed is True
+    assert control_repo.pushed >= 1
+
+
+def test_tick_sync_uses_correct_timeout_exception(monkeypatch):
+    """Regression: the sync wrapper caught ``concurrent.futures.TimeoutExpired``,
+    which does not exist on that module (the builtin ``TimeoutError`` is what
+    ``Future.result`` raises). A real timeout raised ``AttributeError`` instead
+    of the clean tick error, so the failure was misreported."""
+    import concurrent.futures
+
+    assert not hasattr(concurrent.futures, "TimeoutExpired")
+    assert concurrent.futures.TimeoutError is TimeoutError
+
+
 def test_tick_sync_is_bounded(env):
     """The control-repo sync runs inside a hard timeout: a hung git operation
     must surface as a tick error rather than wedging the scheduler."""

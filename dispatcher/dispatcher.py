@@ -176,7 +176,7 @@ class Dispatcher:
             future = pool.submit(self.control.sync)
             try:
                 return future.result(timeout=budget)
-            except concurrent.futures.TimeoutExpired as exc:
+            except TimeoutError as exc:
                 raise TimeoutError(
                     f"control-repo sync exceeded {budget}s (tick deadline "
                     f"{int(remaining)}s remaining)"
@@ -293,17 +293,15 @@ class Dispatcher:
             sha = self._write_outcomes_to_control(inbox, report)
             if sha:
                 report.commit_sha = sha
-                deadline_ok = (self.tick_deadline or 0) - time.time() > 0
-                if deadline_ok:
-                    self.control.push()
-                    report.pushed = True
-                else:
-                    self.log(
-                        "warn",
-                        "tick budget exhausted before push; commit kept local "
-                        "for the next tick",
-                    )
-                    report.errors.append("control push skipped: tick budget exhausted")
+                # Always push. Skipping the push to save tick budget is not
+                # safe: the next tick's fetch + ff-only merge then fails on the
+                # diverged history, which wedges every subsequent sync and
+                # makes the inbox blind to all remote tasks (observed
+                # T-2026-10-06). A push is a small network round trip and is
+                # permitted to overrun the budget by a little; the script's
+                # hard ceiling is the real backstop.
+                self.control.push()
+                report.pushed = True
         except Exception as exc:
             report.errors.append(f"outcome reporting failed: {exc}")
             self.log("error", f"outcome reporting failed: {exc}")
