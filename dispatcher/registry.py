@@ -25,7 +25,7 @@ __all__ = [
 ]
 
 # Task states. Terminal states stop the dispatcher from re-claiming a task.
-STATES = ("READY", "RUNNING", "BLOCKED", "DONE", "FAILED", "CANCELLED")
+STATES = ("PENDING", "READY", "RUNNING", "BLOCKED", "DONE", "FAILED", "CANCELLED")
 TERMINAL_STATES = frozenset({"DONE", "FAILED", "CANCELLED"})
 ACTIVE_STATES = frozenset({"READY", "RUNNING", "BLOCKED"})
 SESSION_AFFINITY = ("dedicated", "existing", "none")
