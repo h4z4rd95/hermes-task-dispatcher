@@ -116,6 +116,11 @@ class Dispatcher:
 
     def _eligible(self, task: Task, inbox: Inbox, states: dict) -> bool:
         state = states.get(task.id)
+        # PENDING is a valid inbox state but is deliberately not runnable.
+        # A task becomes dispatchable only when the owner promotes it to READY.
+        if task.status == "PENDING":
+            self.log("debug", f"{task.id}: status PENDING — not claimable yet")
+            return False
         if task.requires_approval:
             self.log("debug", f"{task.id}: requires owner approval — not claimable yet")
             return False

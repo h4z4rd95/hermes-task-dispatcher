@@ -190,6 +190,17 @@ def test_pause_file_skips_dispatch(env):
     assert report.inbox_tasks == 0
 
 
+def test_pending_task_is_valid_but_not_claimed(env):
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-PENDING", title="Wait for owner",
+                                prompt_inline="p", status="PENDING")])
+    report = d.tick()
+    assert report.inbox_tasks == 1
+    assert report.claimed == []
+    assert router.calls == []
+    assert store.get("T-PENDING").status == "READY"
+
+
 def test_ready_task_is_claimed_and_completes(env):
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-1", title="Smoke", prompt_inline="Reply PONG",

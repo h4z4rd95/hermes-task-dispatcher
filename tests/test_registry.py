@@ -62,6 +62,12 @@ def test_requires_validation():
         Task(id="T-1", title="x", prompt_inline="p", session_affinity="bogus")
 
 
+def test_pending_status_is_valid_and_non_terminal():
+    task = Task(id="T-1", title="x", prompt_inline="p", status="PENDING")
+    assert task.status == "PENDING"
+    assert task.is_terminal is False
+
+
 def test_bad_status_rejected():
     with pytest.raises(InboxError, match="not in"):
         Task(id="T-1", title="x", prompt_inline="p", status="WAT")
