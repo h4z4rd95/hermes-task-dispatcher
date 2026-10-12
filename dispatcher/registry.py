@@ -34,7 +34,7 @@ _INT_FIELDS = {"priority", "workspace_budget_mb", "max_retries", "timeout_second
 _STR_FIELDS = {
     "id", "title", "status", "workstream", "repo", "branch", "prompt_path",
     "prompt_inline", "session", "session_affinity", "model", "approval_note",
-    "purpose",
+    "purpose", "result_note",
 }
 _BOOL_FIELDS = {"parallel_safe", "keep_workspace", "requires_approval"}
 _LIST_FIELDS = {"dependencies"}
@@ -67,6 +67,12 @@ class Task:
     timeout_seconds: int = 900
     model: str = ""
     purpose: str = ""
+    result_note: str = ""
+
+    # Owner-recorded completion variants. The owner may mark a task
+    # COMPLETED_PARTIAL (criteria partially met) rather than DONE; it is a
+    # terminal, non-claimable outcome and must not be re-dispatched.
+    _PARTIAL_STATUSES = frozenset({"COMPLETED_PARTIAL"})
 
     def __post_init__(self) -> None:
         errs = self.validate()
@@ -79,7 +85,7 @@ class Task:
             errs.append("id is required")
         if not self.title:
             errs.append("title is required")
-        if self.status not in STATES:
+        if self.status not in STATES and self.status not in self._PARTIAL_STATUSES:
             errs.append(f"status {self.status!r} not in {STATES}")
         if self.session_affinity not in SESSION_AFFINITY:
             errs.append(f"session_affinity {self.session_affinity!r} not in {SESSION_AFFINITY}")
@@ -97,7 +103,7 @@ class Task:
 
     @property
     def is_terminal(self) -> bool:
-        return self.status in TERMINAL_STATES
+        return self.status in TERMINAL_STATES or self.status in self._PARTIAL_STATUSES
 
     @property
     def needs_checkout(self) -> bool:
@@ -286,7 +292,9 @@ def _parse_inline_table(body: str, *, source: str) -> dict[str, Any]:
 def parse_inbox(text: str, *, source: str = "tasks_inbox.toml") -> Inbox:
     """Parse the inbox TOML text into an :class:`Inbox`."""
     header: dict[str, Any] = {}
-    header_end = len(text)
+    # The [inbox] header is optional. When it is absent the task blocks
+    # start at the top of the file, so the body slice must begin at 0.
+    header_end = 0
 
     # The optional [inbox] header runs from its marker to the first [[task]].
     m = re.search(r"^\[inbox\][ \t]*$", text, re.MULTILINE)
@@ -335,6 +343,7 @@ _ORDER = (
     "purpose", "prompt_path", "prompt_inline", "session", "session_affinity",
     "parallel_safe", "workspace_budget_mb", "keep_workspace", "requires_approval",
     "approval_note", "dependencies", "max_retries", "timeout_seconds", "model",
+    "result_note",
 )
 
 
@@ -368,7 +377,7 @@ def task_to_toml_block(task: Task) -> str:
             continue
         value = data[key]
         # Keep the block tight: skip empty/opted-out fields we never serialize.
-        if key in ("prompt_path", "prompt_inline", "purpose", "model") and not value:
+        if key in ("prompt_path", "prompt_inline", "purpose", "model", "result_note") and not value:
             continue
         if key == "dependencies" and not value:
             continue

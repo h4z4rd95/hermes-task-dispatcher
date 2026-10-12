@@ -7,6 +7,8 @@ import pytest
 from dispatcher.registry import (
     Inbox,
     InboxError,
+    STATES,
+    TERMINAL_STATES,
     Task,
     inbox_to_toml,
     load_inbox,
@@ -170,3 +172,49 @@ def test_resolved_prompt_from_path(tmp_path):
     missing = Task(id="T-2", title="x", prompt_path="tasks/nope.md")
     with pytest.raises(InboxError, match="not found"):
         missing.resolved_prompt(tmp_path)
+
+
+def test_inbox_without_header_parses_tasks():
+    # A hand-edited inbox may omit the optional [inbox] header entirely;
+    # the task blocks then start at byte 0 and must still be found.
+    text = '[[task]]\nid = "T-001"\ntitle = "Smoke"\nprompt_inline = "x"\n'
+    inbox = parse_inbox(text)
+    assert len(inbox.tasks) == 1
+    assert inbox.tasks[0].id == "T-001"
+
+
+def test_result_note_is_accepted_and_preserved():
+    # The owner records a free-text result_note on completed tasks; an
+    # unknown key would make the whole inbox unparseable (inbox=0, blind).
+    text = (
+        "[inbox]\nversion = 1\n\n"
+        "[[task]]\nid = \"T-001\"\ntitle = \"Smoke\"\nstatus = \"DONE\"\n"
+        "prompt_inline = \"x\"\nresult_note = \"completed 2026-10-12\"\n"
+    )
+    inbox = parse_inbox(text)
+    assert inbox.tasks[0].result_note == "completed 2026-10-12"
+
+    block = task_to_toml_block(inbox.tasks[0])
+    assert 'result_note = "completed 2026-10-12"' in block
+    # An empty result_note is not serialised (block stays tight).
+    bare = Task(id="T-2", title="x", prompt_inline="p")
+    assert "result_note" not in task_to_toml_block(bare)
+
+
+def test_completed_partial_is_terminal_but_not_claimable():
+    # The owner marks a task COMPLETED_PARTIAL when acceptance criteria are
+    # only partly met. It must parse, count as terminal (never re-claimed),
+    # and stay out of the DONE/FAILED/CANCELLED triple.
+    task = Task(id="T-1", title="x", prompt_inline="p", status="COMPLETED_PARTIAL")
+    assert task.is_terminal is True
+    assert task.status not in TERMINAL_STATES
+    # The claim guard treats it the same as DONE.
+    assert not task.is_terminal or task.status == "COMPLETED_PARTIAL"
+
+    text = (
+        "[[task]]\nid = \"T-1\"\ntitle = \"Acceptance\"\n"
+        "status = \"COMPLETED_PARTIAL\"\nprompt_inline = \"x\"\n"
+    )
+    inbox = parse_inbox(text)
+    assert inbox.tasks[0].is_terminal is True
+
