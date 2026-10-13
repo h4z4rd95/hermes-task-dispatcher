@@ -114,21 +114,49 @@ class Dispatcher:
 
     # --- eligibility ---------------------------------------------------------
 
+    def _skip(self, task: Task, state, reason: str) -> None:
+        """Log a non-claimable reason once per change, not once per tick.
+
+        A task that stays PENDING (or otherwise blocked) would otherwise emit
+        the same debug line on every 5-minute tick forever (Issue #23). The
+        reason is persisted on the state row; when it changes the new reason is
+        logged, otherwise the tick stays quiet. Actionable transitions
+        (claim, recovery, terminal result) are logged elsewhere and are
+        unaffected.
+        """
+        previous = state.last_skip_reason if state is not None else None
+        if previous == reason:
+            return
+        self.log("debug", f"{task.id}: {reason}")
+        try:
+            if state is not None:
+                self.store.set_skip_reason(task.id, reason)
+            else:
+                # No state row yet: seed one so the reason can be persisted.
+                from .state import TaskState
+
+                seeded = TaskState(task_id=task.id, status="READY",
+                                   last_skip_reason=reason)
+                self.store.upsert(seeded)
+        except Exception as exc:  # logging must never break eligibility
+            self.log("warn", f"{task.id}: could not persist skip reason: {exc}")
+
     def _eligible(self, task: Task, inbox: Inbox, states: dict) -> bool:
         state = states.get(task.id)
         # PENDING is a valid inbox state but is deliberately not runnable.
         # A task becomes dispatchable only when the owner promotes it to READY.
         if task.status == "PENDING":
-            self.log("debug", f"{task.id}: status PENDING — not claimable yet")
+            self._skip(task, state, "status PENDING — not claimable yet")
             return False
         if task.requires_approval:
-            self.log("debug", f"{task.id}: requires owner approval — not claimable yet")
+            self._skip(task, state, "requires owner approval — not claimable yet")
             return False
         if task.is_terminal:
             return False
         if state is None:
             return True  # a new READY task with no state row yet
         if state.status != "READY":
+            self._skip(task, state, f"state {state.status} — not claimable")
             return False
         # Dependencies: every dependency must be DONE.
         index = inbox.by_id()
@@ -280,6 +308,12 @@ class Dispatcher:
             if claimed is None:
                 self.log("debug", f"{task.id}: already claimed by another tick")
                 continue
+            # Claiming is an actionable transition — clear any stored skip
+            # reason so a later re-block is logged as a fresh event.
+            try:
+                self.store.set_skip_reason(task.id, "")
+            except Exception:
+                pass
             report.claimed.append(task.id)
             running += 1
             try:

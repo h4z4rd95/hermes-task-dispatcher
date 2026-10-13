@@ -18,7 +18,23 @@ from dispatcher.router import (
     _count_from_dry_run,
     _detect_resumed,
     _parse_session_id,
+    _set_format_text_supported,
+    _set_new_session_flags_supported,
 )
+
+
+@pytest.fixture(autouse=True)
+def _pin_modern_cli():
+    """Pin the capability probes so tests never shell out to a real hermes.
+
+    The suite describes the >= 0.21.x command line; the legacy (v0.19.x) path
+    has its own tests below.
+    """
+    _set_new_session_flags_supported(True)
+    _set_format_text_supported(True)
+    yield
+    _set_new_session_flags_supported(None)
+    _set_format_text_supported(None)
 
 RESUME_STDOUT = (
     "↻ Resumed session 20261005_030008_17da54 \"probe-new-session-001\" "
@@ -440,3 +456,63 @@ def test_runresult_defaults():
     r = RunResult(session_id="x", exit_code=0, stdout="s", duration_s=1.0)
     assert r.resumed is False
     assert r.timed_out is False
+
+
+# ---------------------------------------------------------------------- #
+# Legacy CLI (Hermes v0.19.x): no --create-if-missing, probe + rename
+# ---------------------------------------------------------------------- #
+
+
+def test_legacy_cli_probes_then_runs_unnamed_and_renames(monkeypatch):
+    _set_new_session_flags_supported(False)
+    monkeypatch.setattr(
+        SessionRouter, "_session_title_exists_in_db", lambda self, name: False
+    )
+    runner = FakeRunner(stdout=FRESH_STDOUT)
+    router = make_router(runner)
+    res = router.run(session_name="legacy-1", prompt="hi")
+
+    chat_calls = [c for c in runner.calls if c["cmd"][1] == "chat"]
+    assert len(chat_calls) == 1
+    cmd = chat_calls[0]["cmd"]
+    assert "--create-if-missing" not in cmd
+    assert "--continue" not in cmd  # unknown name -> fresh run
+    assert "-q" in cmd and "-" in cmd
+    assert res.session_id == "20261005_031844_e29272"
+
+    # The fresh session is renamed so the next run can resume it.
+    rename = [c for c in runner.calls if c["cmd"][1:3] == ["sessions", "rename"]]
+    assert len(rename) == 1
+    assert rename[0]["cmd"][3] == "20261005_031844_e29272"
+    assert rename[0]["cmd"][4] == "legacy-1"
+
+
+def test_legacy_cli_resumes_known_session_by_name(monkeypatch):
+    _set_new_session_flags_supported(False)
+    monkeypatch.setattr(
+        SessionRouter, "_session_title_exists_in_db", lambda self, name: True
+    )
+    runner = FakeRunner(stdout=RESUME_STDOUT)
+    router = make_router(runner)
+    res = router.run(session_name="legacy-1", prompt="hi")
+
+    chat_calls = [c for c in runner.calls if c["cmd"][1] == "chat"]
+    cmd = chat_calls[0]["cmd"]
+    assert "--continue" in cmd and "legacy-1" in cmd
+    assert "--create-if-missing" not in cmd
+    # Known session: no rename call.
+    assert not [c for c in runner.calls if c["cmd"][1:3] == ["sessions", "rename"]]
+    assert res.resumed is True
+
+
+def test_legacy_cli_drops_unsupported_flags(monkeypatch):
+    _set_new_session_flags_supported(False)
+    monkeypatch.setattr(
+        SessionRouter, "_session_title_exists_in_db", lambda self, name: False
+    )
+    runner = FakeRunner(stdout=FRESH_STDOUT)
+    router = make_router(runner, workdir=Path("/some/where"))
+    router.run(session_name="legacy-1", prompt="hi", run_budget_s=900)
+    cmd = [c for c in runner.calls if c["cmd"][1] == "chat"][0]["cmd"]
+    for flag in ("--in", "--run-budget", "--query-file"):
+        assert flag not in cmd

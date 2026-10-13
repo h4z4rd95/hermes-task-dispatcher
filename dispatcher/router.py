@@ -41,11 +41,43 @@ HERMES_BIN = shutil.which("hermes") or "hermes"
 # ``--help`` parse (no side effects, no network); the result is per-process.
 _FORMAT_TEXT_SUPPORTED: bool | None = None
 
+# ``chat --create-if-missing`` / ``--query-file`` support cache. These exist
+# only on Hermes >= 0.21.x. Older builds (the deployed v0.19.0) have neither,
+# and their ``--continue <name>`` fails when the named session is unknown, so
+# the router must fall back to a probe-then-rename flow (see
+# :meth:`SessionRouter.run`). None = not probed yet; per-process.
+_NEW_SESSION_FLAGS_SUPPORTED: bool | None = None
+
 
 def _set_format_text_supported(value: bool | None) -> None:
     """Test seam: pin the probe result so tests do not shell out."""
     global _FORMAT_TEXT_SUPPORTED  # noqa: PLW0603 — intentional test seam
     _FORMAT_TEXT_SUPPORTED = value
+
+
+def _set_new_session_flags_supported(value: bool | None) -> None:
+    """Test seam: pin the probe result so tests do not shell out."""
+    global _NEW_SESSION_FLAGS_SUPPORTED  # noqa: PLW0603 — intentional test seam
+    _NEW_SESSION_FLAGS_SUPPORTED = value
+
+
+def _cli_supports_new_session_flags(hermes_bin: str) -> bool:
+    """Whether the installed Hermes CLI has the modern session flags.
+
+    ``chat --create-if-missing`` (create a named session on first run) and
+    ``--query-file`` (prompt via stdin) are both >= 0.21.x. Probed with
+    ``chat --help`` (read-only, no session created).
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 — argv list, never a shell string
+            [hermes_bin, "chat", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and "--create-if-missing" in (proc.stdout or "")
 
 
 def _cli_supports_format_text(hermes_bin: str) -> bool:
@@ -131,6 +163,15 @@ def _default_runner(
         timeout=timeout,
         input=_stdin_payload(cmd),
     )
+
+
+def _to_text(chunk: bytes | str | None) -> str:
+    """Decode partial subprocess output that arrives as raw bytes on timeout."""
+    if chunk is None:
+        return ""
+    if isinstance(chunk, bytes):
+        return chunk.decode(errors="replace")
+    return chunk
 
 
 def _uses_stdin(cmd: list[str]) -> bool:
@@ -285,7 +326,38 @@ class SessionRouter:
             )
             return False
 
-        return _count_from_dry_run(proc.stdout) > 0
+        if _count_from_dry_run(proc.stdout) > 0:
+            return True
+
+        # Fallback for builds where the CLI title filter is unreliable: on
+        # Hermes v0.19.0 the export dry-run count is always 0 regardless of the
+        # title, so the probe above would answer "does not exist" for a session
+        # that does exist, and every run would spawn a fresh session (breaking
+        # session affinity and duplicating titles). Query the session store
+        # directly, read-only.
+        return self._session_title_exists_in_db(session_name)
+
+    def _session_title_exists_in_db(self, session_name: str) -> bool:
+        """Read-only exact-title lookup against the live Hermes session store."""
+        import sqlite3
+
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        db = os.path.join(home, "state.db")
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT 1 FROM sessions WHERE title = ? LIMIT 1",
+                    (session_name,),
+                ).fetchone()
+                return row is not None
+            finally:
+                con.close()
+        except Exception as exc:
+            # Fail closed: the caller treats False as "create a new session",
+            # which is always the safe direction.
+            self._log(f"session db title lookup failed: {exc}")
+            return False
 
     # ------------------------------------------------------------------ #
     # Run
@@ -313,16 +385,29 @@ class SessionRouter:
         if not prompt:
             raise RouterError("prompt is required")
 
+        if _NEW_SESSION_FLAGS_SUPPORTED is None:
+            _set_new_session_flags_supported(
+                _cli_supports_new_session_flags(self._bin)
+            )
+        new_cli = bool(_NEW_SESSION_FLAGS_SUPPORTED)
+
+        # Only the legacy (v0.19.x) path needs to know whether the session
+        # exists: --create-if-missing handles both cases on newer builds.
+        session_exists = None
+        if not new_cli:
+            session_exists = self.session_name_exists(session_name)
+
         cmd = self._build_cmd(
             session_name=session_name,
             model=model,
             max_turns=max_turns,
             run_budget_s=run_budget_s,
+            resume_by_name=bool(session_exists),
         )
         self._log(
             f"run session={session_name!r} model={model or 'default'} "
             f"max_turns={max_turns} budget={run_budget_s}s "
-            f"workdir={self.workdir!s}"
+            f"workdir={self.workdir!s} resume_by_name={session_exists}"
         )
 
         _PROMPT_HOLDER[0] = prompt
@@ -347,7 +432,11 @@ class SessionRouter:
             except subprocess.TimeoutExpired as exc:
                 timed_out = True
                 # TimeoutExpired carries partial output in .output/.stderr.
-                stdout = (exc.output or "") + (exc.stderr or "")
+                # CPython attaches whatever the pipes had already buffered as
+                # raw bytes even when text=True, so decode defensively — a
+                # timeout must record a failed run, not crash the tick with a
+                # str/bytes TypeError.
+                stdout = _to_text(exc.output) + _to_text(exc.stderr)
                 duration_s = time.monotonic() - started
                 self._log(
                     f"run session={session_name!r} timed out after "
@@ -375,6 +464,11 @@ class SessionRouter:
                 f"session_id line"
             )
 
+        if not new_cli and not session_exists and session_id:
+            # Name the freshly created session so the next run resumes it
+            # instead of spawning another one.
+            self._rename_session(session_id, session_name)
+
         return RunResult(
             session_id=session_id,
             exit_code=proc.returncode,
@@ -394,14 +488,27 @@ class SessionRouter:
         model: str | None,
         max_turns: int | None,
         run_budget_s: int | None,
+        resume_by_name: bool = True,
     ) -> list[str]:
+        if _NEW_SESSION_FLAGS_SUPPORTED is None:
+            _set_new_session_flags_supported(
+                _cli_supports_new_session_flags(self._bin)
+            )
+        new_cli = bool(_NEW_SESSION_FLAGS_SUPPORTED)
+
         cmd: list[str] = [
             self._bin,
             "chat",
-            "--continue", session_name,
-            "--create-if-missing",
-            "-Q",
         ]
+        if new_cli:
+            # Creates the named session on first run, resumes it afterwards.
+            cmd += ["--continue", session_name, "--create-if-missing"]
+        elif resume_by_name:
+            # v0.19.x: --continue only resumes; a name that does not exist is
+            # a hard error, so it is only used when the session is known to
+            # exist (the caller probes first).
+            cmd += ["--continue", session_name]
+        cmd += ["-Q"]
         # ``--format text`` exists only on Hermes >= 0.21.5 (upstream 158fd638).
         # The server runtime at takeover is 0.21.3 (40f2702b); emitting the flag
         # there dies in argparse before the task ever runs, which is how a
@@ -412,16 +519,50 @@ class SessionRouter:
             _set_format_text_supported(_cli_supports_format_text(self._bin))
         if _FORMAT_TEXT_SUPPORTED:
             cmd += ["--format", "text"]
-        cmd += ["--query-file", "-"]
+        if new_cli:
+            cmd += ["--query-file", "-"]
+        else:
+            # v0.19.x reads the prompt from stdin via ``-q -``.
+            cmd += ["-q", "-"]
         if self.workdir is not None:
-            cmd += ["--in", str(self.workdir)]
+            if new_cli:
+                cmd += ["--in", str(self.workdir)]
+            # v0.19.x has no --in; the child inherits the dispatcher's cwd.
         if model:
             cmd += ["--model", model]
         if max_turns is not None:
             cmd += ["--max-turns", str(int(max_turns))]
         if run_budget_s is not None:
-            cmd += ["--run-budget", str(int(run_budget_s))]
+            if new_cli:
+                cmd += ["--run-budget", str(int(run_budget_s))]
+            # v0.19.x has no --run-budget; run_budget_s is still enforced as
+            # the subprocess timeout by the caller.
         return cmd
+
+    def _rename_session(self, session_id: str, title: str) -> None:
+        """Give a freshly created session its task name (v0.19.x path only).
+
+        On builds without ``--create-if-missing`` a session is created unnamed;
+        naming it lets the next run resume it by title.
+        """
+        cmd = [self._bin, "sessions", "rename", session_id, title]
+        try:
+            proc = self._runner(
+                cmd,
+                cwd=self.workdir,
+                env=self._child_env(),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode != 0:
+                self._log(
+                    f"sessions rename {session_id} -> {title!r} exit="
+                    f"{proc.returncode}: "
+                    f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
+                )
+        except Exception as exc:  # renaming is a convenience, not a gate
+            self._log(f"sessions rename {session_id} -> {title!r} failed: {exc}")
 
     def _child_env(self) -> dict[str, str]:
         env = dict(os_env())

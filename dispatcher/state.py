@@ -120,6 +120,10 @@ class TaskState:
     session_id: str = ""
     workspace_path: str = ""
     commit_sha: str = ""
+    # Last reason this task was skipped (not claimable) at eligibility check.
+    # Persisted so a repeated non-actionable skip is logged once per change
+    # instead of every tick (Issue #23).
+    last_skip_reason: str = ""
     updated_at: float = _now()
 
     def to_row(self) -> dict[str, Any]:
@@ -136,6 +140,7 @@ class TaskState:
             "session_id": self.session_id,
             "workspace_path": self.workspace_path,
             "commit_sha": self.commit_sha,
+            "last_skip_reason": self.last_skip_reason,
             "updated_at": self.updated_at,
         }
 
@@ -154,6 +159,7 @@ class TaskState:
             session_id=row["session_id"] or "",
             workspace_path=row["workspace_path"] or "",
             commit_sha=row["commit_sha"] or "",
+            last_skip_reason=row["last_skip_reason"] if "last_skip_reason" in row.keys() else "",
             updated_at=row["updated_at"],
         )
 
@@ -172,6 +178,7 @@ CREATE TABLE IF NOT EXISTS task_state (
     session_id      TEXT NOT NULL DEFAULT '',
     workspace_path  TEXT NOT NULL DEFAULT '',
     commit_sha      TEXT NOT NULL DEFAULT '',
+    last_skip_reason TEXT NOT NULL DEFAULT '',
     updated_at      REAL NOT NULL
 );
 """
@@ -203,6 +210,15 @@ class StateStore:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            # Existing DBs predate the last_skip_reason column (added for
+            # Issue #23); add it idempotently. SQLite raises if it exists.
+            try:
+                conn.execute(
+                    "ALTER TABLE task_state ADD COLUMN last_skip_reason "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass
 
     def all_states(self) -> dict[str, TaskState]:
         with self._conn() as conn:
@@ -227,6 +243,19 @@ class StateStore:
         )
         with self._conn() as conn:
             conn.execute(sql, tuple(row[c] for c in cols))
+
+    def set_skip_reason(self, task_id: str, reason: str) -> None:
+        """Record why a task was not claimable at the last eligibility check.
+
+        Called only when the reason differs from the stored one, so a
+        permanently-blocked task stops repeating the same line every tick
+        (Issue #23). An empty reason clears it (the task became claimable).
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE task_state SET last_skip_reason = ? WHERE task_id = ?",
+                (reason, task_id),
+            )
 
     # --- leases -------------------------------------------------------------
 
