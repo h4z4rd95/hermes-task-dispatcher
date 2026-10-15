@@ -22,7 +22,7 @@ from typing import Any
 from .config import Config
 from .registry import Inbox, Task, load_inbox
 from .state import OutcomeRecord, StateStore
-from .verification_gate import VerificationGate
+from .verification_gate import VerificationGate, build_probe
 
 __all__ = ["Dispatcher", "TickReport"]
 
@@ -451,8 +451,17 @@ class Dispatcher:
         gate_status = "PASS"
         gate_bundle_path = ""
         gate_summary = ""
-        gate_tier = getattr(task, "risk_tier", "") or "T1"
+        # Effective tier from the registry contract: declared tier clamped
+        # UP to the policy floor. Never silently downgraded.
+        gate_tier = task.effective_risk_tier
         checkout_root = checkout_path or self.cfg.home
+        # Build the runtime probe from the task's allowlisted probe spec.
+        # Malformed or unknown probes yield BLOCKED (fail closed), never DONE.
+        probe = build_probe(
+            spec=getattr(task, "runtime_probe", None),
+            workspace=checkout_root,
+            logger=self.log,
+        )
         try:
             gate = VerificationGate(
                 task_id=task.id,
@@ -471,7 +480,7 @@ class Dispatcher:
                 require_repo=task.needs_checkout,
             )
             gate_bundle = gate.run(
-                probe=None,
+                probe=probe,
                 test_runner=None,
                 precondition_plan=str(getattr(task, "preconditions", "") or ""),
                 rollback_plan=str(getattr(task, "rollback_plan", "") or ""),

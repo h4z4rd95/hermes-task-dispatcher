@@ -30,12 +30,20 @@ TERMINAL_STATES = frozenset({"DONE", "FAILED", "CANCELLED"})
 ACTIVE_STATES = frozenset({"READY", "RUNNING", "BLOCKED"})
 SESSION_AFFINITY = ("dedicated", "existing", "none")
 
+# Verification-gate risk tiers. T0=docs/metadata, T1=isolated code,
+# T2=integration/pipeline, T3=security/production/financial/destructive.
+# The declared tier may be RAISED by a caller but never lowered below the
+# policy floor. Empty/absent means the policy floor applies.
+RISK_TIERS_ALLOWED = ("T0", "T1", "T2", "T3")
+RISK_TIER_POLICY_FLOOR = "T1"
+
 _INT_FIELDS = {"priority", "workspace_budget_mb", "max_retries", "timeout_seconds"}
 _STR_FIELDS = {
     "id", "title", "status", "workstream", "repo", "branch", "prompt_path",
     "prompt_inline", "session", "session_affinity", "model", "approval_note",
-    "purpose", "result_note",
+    "purpose", "result_note", "risk_tier",
 }
+_DICT_FIELDS = {"runtime_probe"}
 _BOOL_FIELDS = {"parallel_safe", "keep_workspace", "requires_approval"}
 _LIST_FIELDS = {"dependencies"}
 
@@ -51,6 +59,13 @@ class Task:
     status: str = "READY"
     priority: int = 100
     workstream: str = "default"
+    # Owner-declared verification risk tier (T0/T1/T2/T3). Empty = policy
+    # floor. Validated at parse time; never silently downgraded.
+    risk_tier: str = ""
+    # Optional runtime probe spec for T2+ tasks. A table with a strictly
+    # allowlisted "handler" key; unknown handlers/malformed specs are rejected
+    # by the gate (BLOCKED), never executed. See dispatcher/probes.py.
+    runtime_probe: dict[str, Any] = field(default_factory=dict)
     repo: str = ""
     branch: str = "main"
     prompt_path: str = ""
@@ -99,11 +114,34 @@ class Task:
             errs.append("priority must be an integer")
         if not isinstance(self.dependencies, list):
             errs.append("dependencies must be a list of task ids")
+        if self.risk_tier:
+            if not isinstance(self.risk_tier, str) or self.risk_tier.strip().upper() not in RISK_TIERS_ALLOWED:
+                errs.append(
+                    f"risk_tier {self.risk_tier!r} not in {list(RISK_TIERS_ALLOWED)}"
+                )
         return errs
+
 
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATES or self.status in self._PARTIAL_STATUSES
+
+    @property
+    def effective_risk_tier(self) -> str:
+        """Effective gate tier: the declared tier, or the policy floor.
+
+        A declared tier below the policy floor is clamped UP to the floor
+        (never silently downgraded); a declared higher tier is preserved.
+        """
+        declared = (self.risk_tier or "").strip().upper()
+        if declared in RISK_TIERS_ALLOWED:
+            return declared if RISK_TIERS_ALLOWED.index(declared) >= RISK_TIERS_ALLOWED.index(RISK_TIER_POLICY_FLOOR) else RISK_TIER_POLICY_FLOOR
+        return RISK_TIER_POLICY_FLOOR
+
+    @property
+    def declared_risk_tier(self) -> str:
+        """The raw declared tier ('' when the owner left it to policy)."""
+        return (self.risk_tier or "").strip().upper()
 
     @property
     def needs_checkout(self) -> bool:
@@ -170,9 +208,34 @@ def _strip_comment(line: str) -> str:
     return line
 
 
+def _parse_inline_table_value(raw: str, *, source: str) -> dict[str, Any]:
+    """Parse a TOML inline table value ``{ k = v, ... }`` into a dict.
+
+    Only the flat, one-level form is supported — which is exactly what the
+    runtime_probe contract requires. Values reuse `_parse_value` recursively.
+    """
+    body = raw[1:-1].strip()
+    out: dict[str, Any] = {}
+    if not body:
+        return out
+    for part in _split_top_level(body):
+        part = part.strip()
+        if not part:
+            continue
+        m = _KEY_VALUE.match(part)
+        if not m:
+            raise InboxError(f"{source}: cannot parse inline table entry {part!r}")
+        k, v = m.group(1), m.group(2).strip()
+        out[k] = _parse_value(v, source=source)
+    return out
+
+
 def _parse_value(raw: str, *, source: str) -> Any:
     raw = raw.strip()
     if not raw:
+        raise InboxError(f"{source}: empty value")
+    if raw.startswith("{") and raw.endswith("}"):
+        return _parse_inline_table_value(raw, source=source)
         return ""
     if raw.startswith('"""') and raw.endswith('"""') and len(raw) >= 6:
         return raw[3:-3]
@@ -317,10 +380,16 @@ def parse_inbox(text: str, *, source: str = "tasks_inbox.toml") -> Inbox:
         # drop the [[task]] header line itself
         kv_block = re.sub(r"^\[\[task\]\][ \t]*\n", "", block, count=1)
         kv = _parse_inline_table(kv_block, source=f"{source}:task[{i}]")
-        known = set(_STR_FIELDS) | _INT_FIELDS | _BOOL_FIELDS | _LIST_FIELDS
+        known = set(_STR_FIELDS) | _INT_FIELDS | _BOOL_FIELDS | _LIST_FIELDS | _DICT_FIELDS
         unknown = set(kv) - known
         if unknown:
             raise InboxError(f"{source}:task[{i}]: unknown key(s) {sorted(unknown)}")
+        if "risk_tier" in kv and isinstance(kv["risk_tier"], str):
+            kv["risk_tier"] = kv["risk_tier"].strip().upper()
+        if "runtime_probe" in kv and not isinstance(kv["runtime_probe"], dict):
+            raise InboxError(
+                f"{source}:task[{i}]: runtime_probe must be a TOML table"
+            )
         tasks.append(Task(**kv))
 
     inbox = Inbox(version=int(header.get("version", 1)), tasks=tasks)
@@ -343,7 +412,7 @@ _ORDER = (
     "purpose", "prompt_path", "prompt_inline", "session", "session_affinity",
     "parallel_safe", "workspace_budget_mb", "keep_workspace", "requires_approval",
     "approval_note", "dependencies", "max_retries", "timeout_seconds", "model",
-    "result_note",
+    "result_note", "risk_tier", "runtime_probe",
 )
 
 
@@ -359,6 +428,11 @@ def _fmt_value(value: Any) -> str:
             return "[]"
         inner = ", ".join(_fmt_value(v) for v in value)
         return f"[{inner}]"
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        inner = ", ".join(f"{k} = {_fmt_value(v)}" for k, v in value.items())
+        return f"{{{inner}}}"
     text = str(value)
     if "\n" in text:
         escaped = text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
@@ -377,7 +451,10 @@ def task_to_toml_block(task: Task) -> str:
             continue
         value = data[key]
         # Keep the block tight: skip empty/opted-out fields we never serialize.
-        if key in ("prompt_path", "prompt_inline", "purpose", "model", "result_note") and not value:
+        if key in ("prompt_path", "prompt_inline", "purpose", "model", "result_note", "risk_tier") and not value:
+            continue
+        if key == "runtime_probe" and not value:
+            continue
             continue
         if key == "dependencies" and not value:
             continue

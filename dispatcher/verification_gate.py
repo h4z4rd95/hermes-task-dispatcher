@@ -33,8 +33,15 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+from .probes import build_probe as _build_probe
+from .probes import validate_probe_spec as _validate_probe_spec
 
 __all__ = [
     "RISK_TIERS",
@@ -43,6 +50,9 @@ __all__ = [
     "EvidenceBundle",
     "CheckResult",
     "VerificationGate",
+    "PROBE_HANDLERS",
+    "build_probe",
+    "validate_probe_spec",
     "run_from_cli",
     "main",
 ]
@@ -54,6 +64,13 @@ __all__ = [
 RISK_TIERS = ("T0", "T1", "T2", "T3")
 
 GATE_STATUSES = ("PASS", "FAIL", "PARTIAL", "BLOCKED")
+
+# Re-export the probe contract (defined in dispatcher/probes.py) so callers
+# import everything from one place.
+from .probes import PROBE_HANDLERS as PROBE_HANDLERS  # noqa: F401
+
+build_probe = _build_probe
+validate_probe_spec = _validate_probe_spec
 
 # Required checks per tier. A required check with no registered runner fails
 # closed (BLOCKED). T0 never runs test suites — governance section C.
@@ -71,6 +88,10 @@ _MAX_VALUE_CHARS = 200
 
 class GateError(ValueError):
     """Malformed gate invocation (bad tier, unknown check id, bad bundle)."""
+
+
+class _MalformedProbe(ValueError):
+    """A task's runtime_probe spec failed contract validation."""
 
 
 @dataclasses.dataclass
@@ -114,6 +135,9 @@ class EvidenceBundle:
     validator: str = "verification-gate"
     evidence_reused: bool = False
     fetch_back: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Probe target identity: probe evidence must never be reused across
+    # different targets or environments (governance B).
+    runtime_probe: dict[str, Any] = dataclasses.field(default_factory=dict)
     started_at: str = ""
     finished_at: str = ""
     env_digest: str = ""
@@ -142,17 +166,22 @@ class EvidenceBundle:
         known = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in known})
 
-    def identity_key(self, check_id: str) -> str:
-        """Stable key governing evidence reuse (governance section F)."""
-        return "|".join(
-            (
-                self.task_id,
-                check_id,
-                self.final_sha or self.baseline_sha,
-                self.env_digest,
-                self.task_digest,
-            )
-        )
+    def identity_key(self, check_id: str, probe_target: str = "") -> str:
+        """Stable key governing evidence reuse (governance section F).
+
+        Probe evidence additionally keys on the probe target so it can never
+        be reused across a different target or environment.
+        """
+        parts = [
+            self.task_id,
+            check_id,
+            self.final_sha or self.baseline_sha,
+            self.env_digest,
+            self.task_digest,
+        ]
+        if probe_target:
+            parts.append(f"probe={probe_target}")
+        return "|".join(parts)
 
 
 def utcnow() -> str:
@@ -217,6 +246,68 @@ def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 60) -> tuple[in
     )
     out = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, out
+
+
+def _github_owner_repo(url: str) -> "tuple[str, str] | None":
+    """Extract (owner, repo) from a GitHub https URL, else None.
+
+    Uses the standard URL parser so URLs carrying user-info/credentials parse
+    correctly. User-info is *never* returned: this function yields only the
+    owner and repo, and callers must not log the input URL verbatim.
+    """
+    if not url:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme != "https":
+        return None
+    host = (parts.hostname or "").lower()
+    if host not in {"github.com", "www.github.com"}:
+        return None
+    path = parts.path
+    if not path:
+        return None
+    segments = [seg for seg in path.split("/") if seg]
+    if len(segments) != 2:
+        return None
+    owner, repo = segments
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if not owner or not repo or owner in {"settings", "orgs", "features"} or repo in {"", "."}:
+        return None
+    return owner, repo
+
+
+def _github_api_get(path: str, *, token: str, timeout: int = 30) -> "tuple[int, str]":
+    """One bounded, read-only GitHub API GET. Returns (status_code, body).
+
+    Never raises: network errors are returned as a nonzero pseudo-status with
+    a short reason. No token is ever embedded in the returned body.
+    """
+    url = f"https://api.github.com{path}"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "hermes-verification-gate",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return int(resp.status), resp.read(64 * 1024).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read(1024).decode("utf-8", "replace")
+        except Exception:
+            pass
+        return int(exc.code), body
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return -1, f"{type(exc).__name__}: {exc}"[:200]
 
 
 class _Git:
@@ -295,25 +386,134 @@ class _Git:
                     names.update(ln.strip() for ln in out.splitlines() if ln.strip())
         return sorted(names)
 
-    def fetch_verify(self, ref: str = "HEAD") -> dict[str, Any]:
-        """Fetch from origin and confirm the local commit exists remotely.
+    def remote_url(self) -> str:
+        """HTTPS origin URL, or '' when the origin is not a GitHub https URL."""
+        code, out = self._run("config", "--get", "remote.origin.url", timeout=30)
+        if code != 0:
+            return ""
+        url = out.strip()
+        # Strip an embedded credential (https://user:token@host/...) so the
+        # recorded evidence never carries a secret.
+        if "@" in url and url.startswith("https://"):
+            url = "https://" + url.split("@", 1)[1]
+        return url
 
-        Governance section 9: a commit proves a *source* change; remote
-        presence proves it landed. Runtime correctness is recorded separately
-        by the checks, never inferred from the commit.
+    def fetch_verify(self, ref: str = "HEAD") -> dict[str, Any]:
+        """Independent, read-only GitHub verification of the pushed commit.
+
+        This is the governance fetch-back (section 9 / follow-up workstream C):
+        the evidence must represent a fresh, independent read of GitHub — not
+        local workspace presence.
+
+        It resolves the local commit, then performs a read-only GitHub API
+        call (``/repos/{owner}/{repo}/branches/{branch}``) using the token
+        from the environment when available. The check is honest about its
+        method: ``method`` is always one of ``github_api`` (independent read,
+        ``ok`` meaningful), ``local_git`` (no token/network: the result only
+        proves the local clone mirrors its remote-tracking ref — NOT an
+        independent read), or ``error``.
+
+        A commit proves a *source* change; this check proves it landed
+        remotely. Runtime correctness comes from the checks, never from here.
         """
-        record: dict[str, Any] = {"ref": ref, "ok": False}
+        record: dict[str, Any] = {
+            "ref": ref,
+            "ok": False,
+            # The field is explicit so no consumer can mistake a local check
+            # for an independent remote read.
+            "method": "error",
+            "independent_remote_read": False,
+        }
         code, out = self._run("rev-parse", ref, timeout=120)
         if code != 0:
             record["error"] = out.strip()[:300]
             return record
         local = out.strip()
         record["local_sha"] = local
-        # --dry-run avoids pulling objects; it verifies reachability only.
+        record["verified_at"] = utcnow()
+
+        url = self.remote_url()
+        owner_repo = _github_owner_repo(url)
+        if owner_repo is None:
+            # Not a GitHub https remote: fall back to an honest local check.
+            return self._fetch_verify_local(ref, local, record)
+
+        owner, repo_name = owner_repo
+        record["remote_repo"] = f"{owner}/{repo_name}"
+        # branch resolution: prefer the ref name, else HEAD's upstream
+        branch = ref if ref != "HEAD" else self._current_branch()
+        if not branch:
+            record["error"] = "could not resolve branch for independent read"
+            return record
+        record["branch"] = branch
+
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if not token:
+            record["method"] = "local_git"
+            record["error"] = (
+                "no GITHUB_TOKEN/GH_TOKEN: independent GitHub API read not "
+                "available; falling back to local remote-tracking ref only"
+            )
+            return self._fetch_verify_local(ref, local, record)
+
+        code, out = _github_api_get(
+            f"/repos/{owner}/{repo_name}/branches/{urllib.parse.quote(branch, safe='')}",
+            token=token,
+            timeout=30,
+        )
+        if code not in (200, 404):
+            # transient/network failure; a bounded single retry
+            time.sleep(2)
+            code, out = _github_api_get(
+                f"/repos/{owner}/{repo_name}/branches/{urllib.parse.quote(branch, safe='')}",
+                token=token,
+                timeout=30,
+            )
+        if code != 200:
+            record["method"] = "github_api"
+            record["error"] = (
+                f"github api branch read failed: HTTP {code}: {out.strip()[:150]}"
+            )
+            return record
+        try:
+            payload = json.loads(out)
+            remote_sha = str(payload.get("commit", {}).get("sha", ""))
+        except Exception as exc:  # noqa: BLE001
+            record["method"] = "github_api"
+            record["error"] = f"could not parse branch payload: {exc}"[:200]
+            return record
+        record["method"] = "github_api"
+        record["independent_remote_read"] = True
+        record["remote_sha"] = remote_sha
+        record["ok"] = remote_sha == local
+        if not record["ok"]:
+            record["error"] = (
+                f"remote branch HEAD {remote_sha[:12]} != local {local[:12]}"
+            )
+        return record
+
+    def _current_branch(self) -> str:
+        code, out = self._run("rev-parse", "--abbrev-ref", "HEAD", timeout=30)
+        return out.strip() if code == 0 else ""
+
+    def _fetch_verify_local(
+        self, ref: str, local: str, record: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Honest local-only fallback; never claims an independent read.
+
+        Renamed and scoped deliberately (follow-up workstream C): the previous
+        implementation reported ``ok`` from a local ``git fetch --dry-run`` +
+        ``branch -r --contains``, which some consumers could read as an
+        independent GitHub check. This fallback keeps the same local logic but
+        labels it ``local_git`` with ``independent_remote_read=False``.
+        """
+        record.setdefault("method", "local_git")
+        record["method"] = "local_git"
+        record["independent_remote_read"] = False
         code, out = self._run("fetch", "--dry-run", "origin", timeout=180)
         record["fetch_exit"] = code
         if code != 0:
-            record["error"] = out.strip()[:300]
+            record["error"] = (record.get("error", "") + " | local fetch failed").strip(" |")
             return record
         code, out = self._run("branch", "-r", "--contains", local, timeout=120)
         if code == 0:
@@ -321,11 +521,8 @@ class _Git:
             record["remote_contains"] = branches[:4]
             record["ok"] = bool(branches)
         else:
-            # remote branch listing unavailable: fall back to ls-remote
             code, out = self._run("ls-remote", "origin", timeout=120)
             record["ok"] = local in out
-            if not record["ok"]:
-                record["error"] = "commit not found in origin refs"
         return record
 
 
@@ -353,6 +550,7 @@ class VerificationGate:
         branch: str = "",
         env_extra: dict[str, str] | None = None,
         require_repo: bool = True,
+        probe_spec: Any = None,
     ):
         task_id = (task_id or "").strip()
         if not task_id:
@@ -376,6 +574,16 @@ class VerificationGate:
         # a recorded reason) instead of BLOCKED on a non-repo workspace. Used
         # for prompt-only tasks that have no checkout by design.
         self.require_repo = require_repo
+        # Task-declared runtime probe spec (allowlisted handlers only; see
+        # dispatcher/probes.py). None/'' means no probe: T2+ then fails closed
+        # with a recorded reason. A malformed spec yields BLOCKED.
+        self.probe_spec = probe_spec
+        self._probe_error = ""
+        try:
+            self._probe_runner = _build_probe(probe_spec, self.repo_path, logger=None)
+        except ValueError as exc:
+            self._probe_runner = None
+            self._probe_error = str(exc)
 
     # -- evidence discovery ------------------------------------------------
 
@@ -522,34 +730,66 @@ class VerificationGate:
         )
         return code
 
+    def _probe_effective_runner(self):
+        """Runner for the task's declared probe, or the reason it is unusable.
+
+        Distinguishes the failure modes the governance prompt requires to
+        fail closed: malformed spec (raises, -> BLOCKED), missing runner
+        (None -> PARTIAL, fatal for T2+), and execution error (BLOCKED).
+        """
+        if self._probe_error:
+            raise _MalformedProbe(self._probe_error)
+        return self._probe_runner
+
     def check_runtime_probe(
-        self, runner: "Callable[[], tuple[int, str]] | None" = None
+        self,
+        runner: "Callable[[], tuple[int, str, dict[str, Any]]] | None" = None,
     ) -> "CheckResult":
-        """T2+: real API/log/DB/runtime probe injected per task."""
+        """T2+: real API/log/DB/runtime probe built from the task's spec.
+
+        ``runner`` is the zero-argument runner produced by
+        :func:`dispatcher.probes.build_probe`; it returns
+        ``(exit_code, output, evidence)`` where ``evidence`` carries the
+        probe/target/environment identity recorded in the bundle.
+
+        A missing probe is PARTIAL for T2+ (fatal: the task is not proven).
+        A malformed probe spec, a probe timeout, or a probe that raises is
+        BLOCKED — never DONE.
+        """
         started = utcnow()
         if runner is None:
             return CheckResult(
                 check_id="runtime_probe",
                 status="PARTIAL",
                 command="(none provided)",
-                skip_reason="no runtime probe defined for this task",
+                skip_reason="no runtime_probe defined for this task (required for T2+)",
                 started_at=started,
             )
         try:
-            code, out = runner()
+            result = runner()
+            # Accept both 2-tuple (legacy) and 3-tuple (with evidence).
+            if isinstance(result, tuple) and len(result) == 3:
+                code, out, probe_evidence = result
+            else:
+                code, out = result
+                probe_evidence = {}
+        except _MalformedProbe:
+            raise  # handled by the dispatch loop -> BLOCKED
         except Exception as exc:  # noqa: BLE001
             return CheckResult(
                 check_id="runtime_probe",
                 status="BLOCKED",
+                command="(probe)",
                 skip_reason=f"probe error: {type(exc).__name__}: {exc}"[:200],
                 started_at=started,
             )
         return CheckResult(
             check_id="runtime_probe",
             status="PASS" if code == 0 else "FAIL",
-            command="(injected probe)",
+            command=f"probe:{probe_evidence.get('handler', '?')}",
             exit_code=code,
             output=redact(out),
+            evidence_ref=str(probe_evidence.get("target", "")),
             started_at=started,
         )
 
@@ -643,13 +883,22 @@ class VerificationGate:
     def run(
         self,
         *,
-        probe: "Callable[[], tuple[int, str]] | None" = None,
+        probe: "Callable[[], tuple[int, str, dict[str, Any]]] | None" = None,
         test_runner: "Callable[[list[str]], int] | None" = None,
         precondition_plan: str = "",
         rollback_plan: str = "",
         evidence_path: "Path | None" = None,
     ) -> EvidenceBundle:
-        """Execute one verification pass. Returns the bundle (not yet written)."""
+        """Execute one verification pass. Returns the bundle (not yet written).
+
+        ``probe`` is accepted for backward compatibility; the probe is now
+        built from the task's ``probe_spec`` (see :mod:`dispatcher.probes`).
+        """
+        if probe is not None and self.probe_spec is None:
+            # A legacy injected runner was passed with no task spec: use it
+            # directly so old callers keep working.
+            self._probe_runner = probe
+            self._probe_error = ""
         git = _Git(self.repo_path)
         started = utcnow()
         bundle = EvidenceBundle(
@@ -704,17 +953,31 @@ class VerificationGate:
             "diff_inspect": self.check_diff_inspect,
             "files_exist_remote": lambda: self.check_files_exist_remote(),
             "targeted_tests": lambda: self.check_targeted_tests(test_runner),
-            "runtime_probe": lambda: self.check_runtime_probe(probe),
+            "runtime_probe": lambda: self.check_runtime_probe(
+                self._probe_effective_runner()
+            ),
             "preconditions": lambda: self.check_preconditions(precondition_plan),
             "rollback_plan": lambda: self.check_rollback_plan(rollback_plan),
         }
         runners.update(self.custom_checks)
 
+        # Probe target identity gates reuse of runtime_probe evidence: probe
+        # evidence must never be reused across a different target.
+        probe_target = ""
+        if self.probe_spec is not None:
+            try:
+                probe_target = str(_validate_probe_spec(self.probe_spec).get("target", ""))
+            except Exception:
+                probe_target = ""
+
         for cid in required:
             # Reuse must be decided BEFORE the check runs: the point of the
             # cache is that the expensive command is never executed again
             # while the identity (task/check/commit/env/contract) is current.
-            cached = self._reusable(bundle.identity_key(cid))
+            cache_key = bundle.identity_key(
+                cid, probe_target if cid == "runtime_probe" else ""
+            )
+            cached = self._reusable(cache_key)
             if cached is not None:
                 used_reuse = True
                 checks.append(cached)
@@ -731,9 +994,33 @@ class VerificationGate:
                     )
                 )
                 continue
-            checks.append(runner_fn())
+            try:
+                checks.append(runner_fn())
+            except _MalformedProbe as exc:
+                # The task's probe spec failed contract validation: never DONE.
+                checks.append(
+                    CheckResult(
+                        check_id=cid,
+                        status="BLOCKED",
+                        command="(probe spec)",
+                        skip_reason=f"malformed probe spec: {exc}"[:200],
+                        started_at=utcnow(),
+                    )
+                )
+                continue
 
         bundle.checks = [redact(c.to_dict()) for c in checks]
+
+        # Record probe identity (target/environment) in the bundle so probe
+        # evidence can never be silently reused across a different target.
+        for c in checks:
+            if c.check_id == "runtime_probe" and c.status == "PASS":
+                bundle.runtime_probe = {
+                    "probe_id": c.evidence_ref,
+                    "handler": c.command.removeprefix("probe:"),
+                    "target": c.evidence_ref,
+                }
+                break
 
         # criterion results from the agent's evidence, if provided
         if isinstance(agent_bundle.get("criterion_results"), dict):
@@ -782,7 +1069,10 @@ class VerificationGate:
             cache = self._load_cache()
             for c in checks:
                 if c.status == "PASS":
-                    cache[bundle.identity_key(c.check_id)] = {
+                    cache[bundle.identity_key(
+                        c.check_id,
+                        probe_target if c.check_id == "runtime_probe" else "",
+                    )] = {
                         "status": "PASS",
                         "result": redact(c.to_dict()),
                         "recorded_at": utcnow(),

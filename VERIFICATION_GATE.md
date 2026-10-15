@@ -2,9 +2,9 @@
 
 Date: 2026-10-15
 Status: **ACTIVE** — wired into the task dispatcher runtime
-Implementation: `dispatcher/verification_gate.py` + `dispatcher/dispatcher.py`
-Tests: `tests/test_verification_gate.py` (24 tests, all passing)
-Prompt: `prompts/IMPLEMENT_AUTOMATED_VERIFICATION_GATE_2026-10-15.md` (governance repo)
+Implementation: `dispatcher/verification_gate.py`, `dispatcher/probes.py`, `dispatcher/dispatcher.py`
+Tests: `tests/test_verification_gate.py` (24 passing) + `tests/test_verification_gate_followup.py` (33 passing)
+Prompts: `IMPLEMENT_AUTOMATED_VERIFICATION_GATE_2026-10-15.md`, `VERIFICATION_GATE_FOLLOWUP_RISK_PROBES_REMOTE_VERIFY_2026-10-15.md`, `VERIFICATION_GATE_CLOSEOUT_FIXES_AND_SHIP_2026-10-15.md` (governance repo)
 
 ## What it is
 
@@ -12,209 +12,226 @@ A small, dependency-free (stdlib only) verification gate that sits inside the
 Hermes task dispatcher and decides whether a task may become `DONE`.
 
 Before: `status = "DONE" if run.exit_code == 0 else "FAILED"`. A zero exit
-code from the agent process was the only proof of completion. Any later
-reviewer had to re-inspect or re-test the work to be sure.
+code from the agent process was the only proof of completion.
 
 After: the dispatcher runs a `VerificationGate` pass over the task workspace.
-`DONE` is granted only when the gate verdict is `PASS`. The verdict is derived
-from recorded evidence, never from the agent's exit code alone.
+`DONE` is granted only when the gate verdict is `PASS`, derived from recorded
+evidence rather than the agent's exit code.
 
-## How it is invoked (real integration, not guidance)
+## How it is invoked (real integration, automatic)
 
-The gate is invoked by `Dispatcher._run_task` in `dispatcher/dispatcher.py`,
-in the same process, directly after the routed Hermes session run finishes:
+`Dispatcher._run_task` in `dispatcher/dispatcher.py` builds the gate in the
+same process, directly after the routed Hermes session run finishes:
 
 ```python
+gate_tier = task.effective_risk_tier          # registry contract
+probe = build_probe(spec=getattr(task, "runtime_probe", None),
+                    workspace=checkout_root, logger=self.log)
 gate = VerificationGate(
     task_id=task.id,
     repo_path=checkout_root,
     risk_tier=gate_tier,
-    owner="dispatcher",
     prompt_text=prompt,
-    criteria=list(getattr(task, "acceptance_criteria", []) or []),
     cache_path=self.cfg.state_dir / "verification_cache.json",
     branch=task.branch,
     require_repo=task.needs_checkout,
 )
-gate_bundle = gate.run(
-    probe=None,
-    test_runner=None,
-    precondition_plan=str(getattr(task, "preconditions", "") or ""),
-    rollback_plan=str(getattr(task, "rollback_plan", "") or ""),
-)
+gate_bundle = gate.run(...)
 ```
 
-This is **automatic**: it fires on every dispatcher task completion through
-the cron-driven tick (`hermes-task-dispatcher` cron job, every 5 minutes).
-No manual step, no second agent, no extra command to remember.
+This fires on every dispatcher task completion through the cron-driven tick
+(`hermes-task-dispatcher`, every 5 minutes). No manual step.
 
-Status derivation after the gate runs:
+Status derivation:
 
-| agent exit code | gate verdict | task status |
+| agent exit | gate verdict | task status |
 |---|---|---|
 | 0 | `PASS` | `DONE` |
 | 0 | `FAIL` / `PARTIAL` | `FAILED` |
-| 0 | `BLOCKED` | `BLOCKED` (named reason recorded) |
+| 0 | `BLOCKED` | `BLOCKED` (named reason) |
 | non-zero | any | `FAILED` |
 
-The gate itself is fail-closed: if the gate code raises, the task becomes
-`FAILED`, never `DONE`. There is no retry loop — a failed gate does not cause
-the task to be re-executed.
+The gate is fail-closed: if the gate code raises, the task becomes `FAILED`,
+never `DONE`. A failed gate does not trigger a retry loop.
 
-## Risk tiers (governance section C)
+## Risk tier contract (registry)
 
-| Tier | Applies to | Required checks |
-|---|---|---|
-| `T0` | documentation / metadata | `files_exist_remote` |
-| `T1` | isolated code change | `diff_inspect`, `targeted_tests` |
-| `T2` | integration / service / data pipeline | `diff_inspect`, `targeted_tests`, `runtime_probe` |
-| `T3` | security, production migration, financial, destructive | `diff_inspect`, `targeted_tests`, `runtime_probe`, `preconditions`, `rollback_plan` |
+Declared on the task in the inbox TOML:
 
-A task may be **raised** to a higher tier when uncertainty requires it. It may
-never be lowered to save time. `T0` never runs a test suite — that is the
-point of the tier.
+```toml
+[[task]]
+id = "T-..."
+prompt_inline = "..."
+risk_tier = "T2"
+runtime_probe = { handler = "http_get", url = "...", target = "svc:health" }
+```
 
-## Checks
+- Allowed values: `T0`, `T1`, `T2`, `T3` (case-insensitive; normalized to
+  upper case at parse time). Anything else is an `InboxError` at inbox load,
+  so a bad tier never silently degrades.
+- Policy floor is `T1`. `effective_risk_tier` preserves a declared higher
+  tier and clamps a declared `T0` up to the floor: a caller may **raise**
+  risk, never lower it below policy.
+- Omitted/empty tier → policy floor `T1` (backward compatible: existing
+  inbox tasks keep working unchanged).
+- The tier drives the **required checks**, not just metadata.
 
-Each check records: check id, status, command, exit code, bounded output,
-evidence reference, start timestamp, and whether the result was reused.
+| Tier | Required checks |
+|---|---|
+| `T0` | `files_exist_remote` |
+| `T1` | `diff_inspect`, `targeted_tests` |
+| `T2` | `diff_inspect`, `targeted_tests`, `runtime_probe` |
+| `T3` | `diff_inspect`, `targeted_tests`, `runtime_probe`, `preconditions`, `rollback_plan` |
 
-- **`diff_inspect`** — `git status --porcelain` + diff against the baseline
-  SHA. Fail-closed when the workspace is not a repository.
-- **`files_exist_remote`** — every changed path exists in the working tree.
-  T0's only check; deliberately cheap.
-- **`targeted_tests`** — selects only the test files that map to the changed
-  paths (by name convention: `tests/test_<module>.py` etc.). If no test files
-  map to the change, the check is `PARTIAL` with a recorded reason, which is
-  fatal for `T1+` — the change is not proven.
-- **`runtime_probe`** — an injected real API/log/DB/runtime probe for `T2+`.
-  When no probe is defined for a task the check is `PARTIAL` (recorded), so
-  integration tasks fail closed until an owner defines one.
-- **`preconditions` / `rollback_plan`** — documented preconditions and
-  rollback plan, mandatory for `T3` only.
+## Runtime probe contract (T2+)
 
-## Evidence reuse — the duplicate-work kill-switch (section F)
+A runtime probe is the runtime evidence that an integration task actually
+works — not merely that its tests passed. Defined in
+`dispatcher/probes.py`.
+
+**Allowlist, no shell.** A task payload may only select a *named* handler.
+There is no `shell`/`exec`/`command` handler in the contract, so no
+arbitrary command can be executed from a task payload. Handlers:
+
+| handler | what it proves |
+|---|---|
+| `http_get` | GET a URL; check `expect_status` and/or `expect_contains` (redirects not followed, 4 KiB body cap) |
+| `file_exists` | a path **inside the task workspace** exists |
+| `tcp_connect` | `host:port` accepts a TCP connection (pure reachability) |
+| `pytest_module` | one named pytest module inside the workspace passes |
+
+Spec fields: `handler` (required, allowlisted), `target` (required — evidence
+identity), `timeout` (1..120 s, clamped; default 10), plus handler-specific
+fields (`url`, `expect_status`, `expect_contains`, `path`, `host`, `port`).
+Unknown keys are rejected.
+
+**Path containment is enforced twice.** `validate_probe_spec` rejects any
+`path` that is absolute, contains `..`, or escapes the workspace — *before*
+any handler runs. Handlers keep their own `resolve()`-based containment
+checks as defense in depth. Tested by `test_probe_path_traversal_blocked`.
+
+**Fail-closed rules (tested):**
+
+- Missing probe on a T2+ task → check is `PARTIAL` → verdict is not `PASS`.
+- Malformed spec (unknown handler, missing target, unknown key, bad timeout)
+  → the gate records `BLOCKED` with the reason; never `DONE`.
+- Probe that raises, times out, or fails its acceptance condition → `FAIL`.
+- T0/T1 tasks **never run a runtime probe**, even when a probe spec is
+  declared, unless their tier requires it (`test_t0_t1_never_runs_runtime_probe`).
+
+**Evidence identity.** Probe evidence carries `probe_id`, `handler`,
+`target`, `workspace`, `ok`, `started_at`, `duration_s`. The cache identity
+key includes `probe=<target>`, so probe evidence is **never reused across a
+different target** (`test_probe_evidence_not_reused_across_targets`); it is
+reused unchanged only when task/commit/env/task-digest/target all match
+(`test_probe_evidence_reused_same_target`).
+
+A deterministic local fixture exercises the full path: a loopback HTTP server
+on an ephemeral port (`test_http_get_probe_with_local_server_fixture`), plus
+`file_exists` and closed-port `tcp_connect` fixtures. No production service
+is touched by any probe test.
+
+## Evidence reuse — the duplicate-work kill-switch
 
 Evidence is keyed by `(task_id, check_id, commit_sha, env_digest,
-task_digest)`:
+task_digest)` and, for `runtime_probe`, `probe_target`. Reuse is decided
+**before** the check runs: on a cache hit with status `PASS` and all identity
+components current, the cached result is returned and the command is never
+re-executed. A rerun requires a concrete trigger: new diff, changed
+environment/data, stale or contradicted evidence, missing acceptance
+criterion, or raised risk tier.
 
-- `task_id` — the stable task identifier from the inbox.
-- `check_id` — which check produced this evidence.
-- `commit_sha` — the final full SHA of the task workspace.
-- `env_digest` — a coarse digest of the verification environment (OS, arch,
-  Python minor version, git version). Changes only when the runtime changes.
-- `task_digest` — SHA-256 over the task prompt text and acceptance criteria.
-  Changes when the task contract changes.
+Cache: `<DISPATCHER_HOME>/state/verification_cache.json`, written through
+`redact()` so secrets cannot leak into the cache file (tested).
 
-The cache lives at `<DISPATCHER_HOME>/state/verification_cache.json`.
+## Evidence bundle
 
-**Reuse is decided before the check runs.** For each required check the gate
-computes the identity key and looks it up in the cache. On a hit with status
-`PASS` and all identity components still current, the cached result is
-returned and the command is **never executed**. This is the mechanism that
-makes a later reviewer's "please re-test this" cheap: if the identities have
-not changed, the answer is already recorded and the bundle is returned with
-`evidence_reused: true`.
+One JSON artifact per task at `<DISPATCHER_HOME>/state/verification-<task_id>.json`:
+task identity, risk tier, baseline/final SHA, changed files, acceptance
+criteria, per-check records (status, command, exit code, bounded output,
+evidence reference, reused flag, skip reason), blockers, skipped, rollback
+reference, `runtime_probe` identity, `fetch_back`, env/task digests, and
+start/finish timestamps.
 
-A rerun happens only when evidence is stale, missing, contradicted, or the
-task contract changed. Any rerun must have one of these concrete triggers.
+Secrets never enter the bundle: values over 200 chars are truncated,
+token-shaped strings are hashed, and `token=...` assignments become
+`***REDACTED***` (tested in both bundle and cache).
 
-Cache entries are written through `redact()` — secrets cannot leak into the
-cache file (tested).
+## Independent GitHub fetch-back
 
-## Evidence bundle (governance section D)
+`_Git.fetch_verify` performs the governance fetch-back. It is explicit about
+its method, so evidence can never imply an independent GitHub read that did
+not happen:
 
-One JSON artifact per task, written to `<DISPATCHER_HOME>/state/
-verification-<task_id>.json`:
+- `method: "github_api"` — an independent, read-only GitHub API call
+  (`GET /repos/{owner}/{repo}/branches/{branch}`) using `GITHUB_TOKEN` /
+  `GH_TOKEN` from the environment (the cron tick already loads
+  `~/.hermes/.env`). One bounded retry covers pure propagation delay.
+  `independent_remote_read: true`; `ok` means the remote branch HEAD SHA
+  equals the local commit SHA.
+- `method: "local_git"` — no token / non-GitHub remote. Backed by the local
+  clone's remote-tracking state only, with `independent_remote_read: false`
+  and a recorded reason. This is the honest fallback; it is never labelled as
+  an independent remote read.
+- `method: "error"` — the local commit itself could not be resolved.
 
-```
-task_id, status (gate verdict), risk_tier, owner
-repo_path, branch, baseline_sha, final_sha, changed_files
-acceptance_criteria, criterion_results
-checks[]            — per-check: id, status, command, exit_code, output,
-                     evidence_ref, started_at, duration_s, reused, skip_reason
-blockers[], skipped[]
-rollback_ref
-validator           — "verification-gate"
-evidence_reused     — whether any check was served from cache
-fetch_back          — {ref, local_sha, ok, remote_contains / error}
-started_at, finished_at
-env_digest, task_digest
-```
+Recorded fields: `ref`, `local_sha`, `remote_repo`, `branch`, `remote_sha`,
+`verified_at`, `method`, `independent_remote_read`, `ok`, `error`. The
+remote URL is stripped of any embedded user-info before parsing, and no
+token is ever placed in a logged or persisted field. A commit proves a
+*source* change; runtime correctness still comes from the checks.
 
-The agent's own evidence block is discovered at `$VG_EVIDENCE_PATH` or
-`.verification-gate.json` in the task workspace; its `acceptance_criteria`
-and `criterion_results` are folded into the bundle.
+Observed live against the shipped commit: `method=github_api`,
+`independent_remote_read=true`, `ok=true`, local and remote SHA equal.
 
-Secrets never enter the bundle: values longer than 200 chars are truncated,
-token-shaped values are hashed, and `token=...`-style assignments are
-replaced with `***REDACTED***` (tested by `test_secrets_absent_from_written_bundle`).
+## Automation boundary
 
-## Fetch-back verification (governance section 9)
+**Automatic:** gate execution on every dispatcher task completion
+(cron-driven); DONE derivation (fail-closed, no retry loop); evidence
+recording, cache write, and reuse; secret redaction in bundle and cache.
 
-`_Git.fetch_verify` runs `git fetch --dry-run origin` and then
-`git branch -r --contains <sha>` (falling back to `ls-remote`) and records
-the boolean in `bundle.fetch_back`. This records that the commit landed
-remotely. A commit proves a **source** change, not runtime correctness —
-runtime correctness is recorded separately by the checks.
-
-Note: `fetch_back.ok` is a presence check against the local clone's view of
-the remote. On the dispatcher host the workspace clones are fresh, so this
-reflects the push the dispatcher itself performed.
-
-## Automation boundary (what is and is not automatic)
-
-**Automatic:**
-- Gate execution on every dispatcher task completion (cron-driven, no manual
-  step).
-- DONE derivation, fail-closed, with no retry loop.
-- Evidence recording, cache write, and evidence reuse on repeat verification.
-- Secret redaction in both bundle and cache.
-
-**Not automatic (deliberate):**
-- Risk-tier assignment per task: currently defaults to `T1`, read from the
-  task's `risk_tier` field if the inbox schema is extended. Raising a tier is
-  a caller decision.
-- `runtime_probe` content for `T2+` tasks: must be injected per task. Without
-  it the check is PARTIAL and the task fails closed.
-- Graphify and RAG are **not** part of this gate. Per governance section E
-  they are optional aids (structural impact lookup; document retrieval), not
-  correctness oracles. Nothing here calls them.
+**Not automatic (deliberate):** risk-tier assignment per task is owner-authored
+in the inbox (default `T1`); the content of an `http_get`/`tcp_connect`/
+`pytest_module` probe is task-authored within the allowlist. Graphify and RAG
+are not part of this gate — per governance they are optional aids, not
+correctness oracles; nothing here calls them.
 
 ## Rollback / backup
 
-- Full backup of the pre-change dispatcher: `/tmp/vg-backup-live/`
-  (BASE_HEAD recorded inside), plus the earlier `/tmp/vg-backup-3834023/`.
-- To revert: `git checkout HEAD -- dispatcher/dispatcher.py && rm
-  dispatcher/verification_gate.py tests/test_verification_gate.py` and
-  restart the cron job.
+- Pre-change backups: `/tmp/vg-backup-live/`, `/tmp/vg-backup-3834023/`
+  (BASE_HEAD `321128937dcfd01d4d3dd81311309fbd04d2522a`) and
+  `/tmp/vg-fu-backup/` (BASE `e45c5b6ca92efa8453e985ed3a74e2e7a0e8b9b9`).
+- Revert: `git checkout <base> -- dispatcher/ && rm -f
+  dispatcher/probes.py tests/test_verification_gate_followup.py
+  VERIFICATION_GATE.md` and restart the cron job.
 - No production services, DNS, firewall, trading execution, or data volumes
-  were touched. No Hiddify, no TGSG scheduler, no TraderBot backtest.
+  were touched. No Hiddify, no TGSG crawl, no TraderBot backtest.
 
 ## Tests
 
-`tests/test_verification_gate.py` — 24 tests covering the governance
-prompt's required behaviours:
+`tests/test_verification_gate.py` — 24 tests (predecessor behaviours).
+`tests/test_verification_gate_followup.py` — 33 tests (risk-tier contract,
+probe contract and safety, evidence identity/reuse, fetch-back methods and
+honesty flags, backward compatibility).
 
-1. ✅ T0 file edit does not trigger broad test suites
-2. ✅ T1 code edit selects targeted tests (only the mapped test file runs)
-3. ✅ existing valid evidence is reused without rerunning an expensive check
-4. ✅ changed commit / changed task contract invalidates the relevant evidence
-5. ✅ a failed required check cannot produce PASS/DONE
-6. ✅ missing access becomes BLOCKED without unsafe escalation
-7. ✅ final fetch-back/commit identity is represented in the evidence bundle
-8. ✅ secrets are redacted from output, bundle, and cache files
+Focused regression commands and results for the close-out change:
 
-Full suite: `213 passed, 2 failed`. The 2 failures
-(`test_run_uses_verified_routing_primitive`, `test_tick_sync_uses_correct_timeout_exception`)
-are **pre-existing** — they fail identically on the untouched backup at
-`/tmp/vg-backup-live/` and are unrelated to the gate.
+```
+python3 -m pytest tests/test_verification_gate_followup.py -q   # 33 passed
+python3 -m pytest tests/test_verification_gate.py -q            # 24 passed
+python3 -m pytest tests/test_registry.py -q                     # 18 passed
+```
 
-## Out of scope (per governance prompt)
+Pre-existing, unrelated failures (verified identical on the untouched
+backup; not touched by this change per the prompt's debt policy):
+
+- `test_run_uses_verified_routing_primitive`
+- `test_tick_sync_uses_correct_timeout_exception`
+
+## Out of scope (per governance prompts)
 
 No old TraderBot backtests or research experiments were run. The unexecuted
 Tabdeal evaluator was not touched. No TGSG catch-up crawl or scheduler change
-was triggered by this work. No broad RAG rebuilds, no model changes, no new
-paid subscriptions, no new dashboard. No unrelated Hermes or project code was
-refactored. The live TGSG crawl and TraderBot backtest were not used as the
-gate's test fixture — all tests use temporary scratch git repositories.
+was triggered. No broad RAG rebuilds, model changes, paid subscriptions, or
+new dashboards. No unrelated Hermes or project code was refactored. All gate
+tests use temporary scratch git repositories and loopback fixtures.
