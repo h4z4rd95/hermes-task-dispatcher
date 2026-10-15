@@ -141,6 +141,25 @@ re-executed. A rerun requires a concrete trigger: new diff, changed
 environment/data, stale or contradicted evidence, missing acceptance
 criterion, or raised risk tier.
 
+Two structural invariants govern the cache and are pinned by
+`tests/test_verification_gate_cache.py`:
+
+- **Only `PASS` results are cached or reused.** The write path stores entries
+  with `status == "PASS"` only; the read path (`_reusable`) returns an entry
+  only when it is marked `PASS`. FAIL, BLOCKED, and PARTIAL results are
+  therefore never written and can never be promoted to a PASS by a cache hit
+  (`test_failed_result_is_never_cached_or_reused`,
+  `test_blocked_probe_result_is_never_cached`,
+  `test_partial_result_is_never_promoted_by_cache`).
+- **The fetch-back is not part of the cache.** `fetch_verify` runs
+  unconditionally on every `gate.run()`, so a fully cached pass still
+  performs its own fresh independent read (or honestly records the local
+  fallback). A cache hit can never imply or serve a stale remote claim
+  (`test_cache_hit_still_performs_fresh_fetch_back`,
+  `test_fetch_back_is_not_cached_across_runs`,
+  `test_cache_hit_never_fabricates_independent_read`,
+  `test_fetch_back_reflects_remote_mismatch_on_cached_pass`).
+
 Cache: `<DISPATCHER_HOME>/state/verification_cache.json`, written through
 `redact()` so secrets cannot leak into the cache file (tested).
 
@@ -181,6 +200,10 @@ remote URL is stripped of any embedded user-info before parsing, and no
 token is ever placed in a logged or persisted field. A commit proves a
 *source* change; runtime correctness still comes from the checks.
 
+Uncached by design: `fetch_back` is recomputed on every `gate.run()`; it is
+never served from the evidence cache, so its freshness claim always reflects
+an actual read performed by the current execution.
+
 Observed live against the shipped commit: `method=github_api`,
 `independent_remote_read=true`, `ok=true`, local and remote SHA equal.
 
@@ -210,6 +233,10 @@ correctness oracles; nothing here calls them.
 ## Tests
 
 `tests/test_verification_gate.py` — 24 tests (predecessor behaviours).
+`tests/test_verification_gate_cache.py` — 18 tests (final cache validation:
+reuse without rerun, commit/env/task-digest invalidation, probe-target
+isolation and failure isolation, failure non-caching, fetch-back freshness
+and honesty, cache secret hygiene).
 `tests/test_verification_gate_followup.py` — 33 tests (risk-tier contract,
 probe contract and safety, evidence identity/reuse, fetch-back methods and
 honesty flags, backward compatibility).
