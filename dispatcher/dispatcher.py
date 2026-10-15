@@ -22,6 +22,7 @@ from typing import Any
 from .config import Config
 from .registry import Inbox, Task, load_inbox
 from .state import OutcomeRecord, StateStore
+from .verification_gate import VerificationGate
 
 __all__ = ["Dispatcher", "TickReport"]
 
@@ -437,11 +438,80 @@ class Dispatcher:
             except Exception as exc:
                 self.log("warn", f"{task.id}: workspace bind failed: {exc}")
 
-        status = "DONE" if run.exit_code == 0 else "FAILED"
+        # --- Automated verification gate (governance:
+        # VERIFICATION_GATE.md / prompts/IMPLEMENT_AUTOMATED_VERIFICATION_GATE) ---
+        # A zero agent-exit-code is no longer sufficient for DONE. The gate
+        # runs a risk-tiered verification pass over the task workspace and
+        # derives PASS/FAIL/PARTIAL/BLOCKED from recorded evidence. DONE is
+        # only ever granted when the gate says PASS. A gate failure turns the
+        # task into FAILED immediately (no retry loop) unless it is BLOCKED,
+        # in which case the task is BLOCKED with a named reason so the owner
+        # can supply the missing access. The gate is fail-closed: any error
+        # inside the gate itself leaves the task FAILED, not DONE.
+        gate_status = "PASS"
+        gate_bundle_path = ""
+        gate_summary = ""
+        gate_tier = getattr(task, "risk_tier", "") or "T1"
+        checkout_root = checkout_path or self.cfg.home
+        try:
+            gate = VerificationGate(
+                task_id=task.id,
+                repo_path=checkout_root,
+                risk_tier=gate_tier,
+                owner="dispatcher",
+                prompt_text=prompt,
+                criteria=list(getattr(task, "acceptance_criteria", []) or []),
+                cache_path=self.cfg.state_dir / "verification_cache.json",
+                baseline_sha="",
+                branch=task.branch,
+                # Only tasks that actually check out a repository are gated on
+                # repository-based checks. Prompt-only tasks (no repo) run with
+                # require_repo=False so their checks degenerate to
+                # not-applicable instead of blocking DONE.
+                require_repo=task.needs_checkout,
+            )
+            gate_bundle = gate.run(
+                probe=None,
+                test_runner=None,
+                precondition_plan=str(getattr(task, "preconditions", "") or ""),
+                rollback_plan=str(getattr(task, "rollback_plan", "") or ""),
+            )
+            gate_status = gate_bundle.status
+            gate_bundle_path = (
+                str(self.cfg.state_dir / f"verification-{task.id}.json")
+            )
+            gate_bundle.write(Path(gate_bundle_path))
+            gate_summary = (
+                f"gate={gate_status} tier={gate_tier} "
+                f"checks={len(gate_bundle.checks)} "
+                f"reused={gate_bundle.evidence_reused}"
+            )
+            if gate_bundle.blockers:
+                gate_summary += " blockers=" + ";".join(gate_bundle.blockers)[:200]
+        except Exception as exc:
+            # Fail closed. The task is not proven; it must not become DONE.
+            gate_status = "FAIL"
+            gate_summary = f"gate error ({type(exc).__name__}: {exc})"[:300]
+            self.log("error", f"{task.id}: verification gate crashed: {exc}")
+
+        task_exit_ok = run.exit_code == 0
+        if not task_exit_ok:
+            status = "FAILED"
+        elif gate_status == "PASS":
+            status = "DONE"
+        elif gate_status == "BLOCKED":
+            status = "BLOCKED"
+        else:  # FAIL or PARTIAL: never DONE without PASS
+            status = "FAILED"
+
         summary = _truncate(run.stdout.strip(), 800)
+        if gate_summary:
+            summary = (summary + "\n[gate] " + gate_summary)[:1100]
         evidence = [
             {"kind": "session", "session_id": run.session_id, "resumed": run.resumed},
             {"kind": "run", "exit_code": run.exit_code, "duration_s": round(run.duration_s, 1)},
+            {"kind": "gate", "status": gate_status, "tier": gate_tier,
+             "bundle": gate_bundle_path},
         ]
         if checkout_path is not None:
             evidence.append({"kind": "workspace", "path": str(checkout_path)})
