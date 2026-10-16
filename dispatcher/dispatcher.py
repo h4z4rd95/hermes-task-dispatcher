@@ -100,11 +100,48 @@ class Dispatcher:
         if self._workspace is None:
             from .workspace import WorkspaceManager
 
+            # WorkspaceManager expects a logging.Logger (it calls
+            # logger.debug/.warning/.info). The dispatcher's self.log is the
+            # two-argument functional logger; bridge it so a checkout never
+            # crashes the task with "function object has no attribute debug".
+            import logging as _logging
+
+            class _WorkspaceLogBridge(_logging.Logger):
+                def __init__(self, sink):
+                    super().__init__("dispatcher.workspace.bridge")
+                    self._sink = sink
+
+                def _emit(self, level, msg, *args):
+                    try:
+                        if args:
+                            msg = msg % args
+                    except Exception:
+                        pass
+                    self._sink(level, str(msg))
+
+                def debug(self, msg, *args, **kw):
+                    self._emit("debug", msg, *args)
+
+                def info(self, msg, *args, **kw):
+                    self._emit("info", msg, *args)
+
+                def warning(self, msg, *args, **kw):
+                    self._emit("warn", msg, *args)
+
+                def warn(self, msg, *args, **kw):
+                    self._emit("warn", msg, *args)
+
+                def error(self, msg, *args, **kw):
+                    self._emit("error", msg, *args)
+
+                def exception(self, msg, *args, **kw):
+                    self._emit("error", msg, *args)
+
             self._workspace = WorkspaceManager(
                 self.cfg.workspace_pool,
                 global_quota_mb=self.cfg.global_workspace_quota_mb,
                 github_token=self.cfg.github_token(),
-                logger=self.log,
+                logger=_WorkspaceLogBridge(self.log),
             )
         return self._workspace
 

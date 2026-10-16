@@ -6,6 +6,7 @@ spawns a real agent session, clones a repo, or touches the network.
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -501,3 +502,34 @@ def test_tick_sync_is_bounded(env):
     report = d_hang._tick(TickReport())
     assert any("exceeded" in e or "sync" in e for e in report.errors)
     assert router.calls == []
+
+
+def test_workspace_log_bridge_accepts_function_logger():
+    """Regression: WorkspaceManager needs a logging.Logger (logger.debug),
+    but the dispatcher passes its two-argument functional logger. A repo
+    task must survive the workspace checkout path without
+    "function object has no attribute 'debug'".
+    """
+    import logging
+
+    from dispatcher.dispatcher import Dispatcher
+
+    captured = []
+
+    def sink(level, message):
+        captured.append((level, message))
+
+    class _Cfg:
+        workspace_pool = tempfile.mkdtemp()
+        global_workspace_quota_mb = 10
+        github_token = staticmethod(lambda: None)
+
+    d = Dispatcher.__new__(Dispatcher)
+    d.log = sink
+    d.cfg = _Cfg()
+    d._workspace = None
+    mgr = d.workspace  # exercises the bridge construction
+    mgr._log.debug("hello %s", "world")
+    mgr._log.warning("warned %s", "now")
+    assert any("hello world" in m for _, m in captured), captured
+    assert any(l == "warn" for l, _ in captured), captured
