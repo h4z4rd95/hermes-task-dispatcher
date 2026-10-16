@@ -213,6 +213,22 @@ def test_ready_task_is_claimed_and_completes(env):
     assert control_repo.pushed == 1
 
 
+def test_probeless_task_reaches_done(env):
+    """Critical path, regression: a plain task whose registry default
+    ``runtime_probe = {}`` (undeclared) must complete and reach DONE.
+
+    Before the fix, build_probe({}) raised "handler is required" and the
+    tick died on every probe-less task completion.
+    """
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-PLAIN", title="Smoke", prompt_inline="Reply PONG",
+                                session="plain-1")])
+    report = d.tick()
+    assert report.claimed == ["T-PLAIN"]
+    assert "T-PLAIN" in report.completed
+    assert store.get("T-PLAIN").status == "DONE"
+
+
 def test_terminal_task_is_not_reclaimed(env):
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-1", title="Smoke", prompt_inline="p")])

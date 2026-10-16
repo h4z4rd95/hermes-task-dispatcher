@@ -206,6 +206,16 @@ def test_missing_probe_is_none():
     assert build_probe("") is None
 
 
+def test_empty_dict_probe_means_undeclared():
+    """Regression: the registry defaults ``runtime_probe`` to ``{}``; an
+    undeclared probe must build to ``None`` (no probe), never raise.
+    """
+    assert build_probe({}) is None
+    # non-empty specs are still validated strictly
+    with pytest.raises(ValueError, match="handler is required"):
+        build_probe({"target": "x"})
+
+
 def test_malformed_probe_specs_rejected():
     with pytest.raises(ValueError, match="handler is required"):
         validate_probe_spec({})

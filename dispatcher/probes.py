@@ -313,9 +313,15 @@ def build_probe(
     runner that yields ``(exit_code, output, evidence)`` where ``evidence``
     carries the probe/target/environment identity the gate records.
 
-    A malformed spec raises ``ValueError``; the caller turns that into a
-    BLOCKED gate check (never DONE).
+    A spec that is ``None``, an empty string, or an *empty* table means
+    "no probe declared" (returns ``None``). An empty dict is the registry's
+    default for an undeclared probe and must not raise.
     """
+    # An empty dict is the registry default for an undeclared probe:
+    # treat it as "no probe" (None), not a malformed spec. Only a
+    # non-empty spec goes through contract validation.
+    if isinstance(spec, dict) and not spec:
+        return None
     if spec is None or (isinstance(spec, str) and not spec.strip()):
         return None
     normalized = validate_probe_spec(spec)
