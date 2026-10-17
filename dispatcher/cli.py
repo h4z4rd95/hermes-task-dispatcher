@@ -101,6 +101,16 @@ def _cmd_tick() -> int:
         _log("info", f"  completed {task_id}")
     for err in report.errors:
         _log("warn", f"  error: {err}")
+    # Tick-level failures the scheduler must see as incidents. A failed task
+    # (agent exit code) must NOT fail the tick, but a failed outcome publish
+    # leaves records only locally and wedges the next sync — same class as a
+    # budget overrun.
+    if getattr(report, "push_failed", False):
+        _log("error", "tick failed: outcome publish failed (see errors above)")
+        return 4
+    if getattr(report, "sync_failed", False):
+        _log("error", "tick failed: control sync failed (dispatching blind refused)")
+        return 5
     # A failed task must not fail the scheduler; only tick-level failures do.
     # But a tick that overran its own budget is a tick-level failure: it means
     # the scheduler's timeout was the only thing that stopped us, which is

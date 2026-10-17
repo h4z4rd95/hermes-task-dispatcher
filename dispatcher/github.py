@@ -226,10 +226,32 @@ class ControlRepo:
     def push(self) -> None:
         """Publish local commits to ``origin``.
 
-        Uses ``--force-with-lease`` so a divergent remote is rejected rather
-        than overwritten — the control repo must never be force-pushed blind.
+        A task's workspace push (``Dispatcher._maybe_task_commit``) can advance
+        ``origin/main`` *between* the outcome commit and this push, so a naive
+        push is rejected as non-fast-forward: the outcome would then exist only
+        locally and the next tick's ff-only sync would wedge on the diverged
+        history (observed 2026-10-17, T-2026-10-17-RUNTIME-PROOF-002). When the
+        local branch holds unpublished commits and the remote moved on, rebase
+        ours onto theirs first — the local commits are our own unpublished
+        outcome records, so rewriting them is safe, while remote work is never
+        overwritten (no force push).
         """
         branch = self._current_branch()
+        self._git_ok(["fetch", "--quiet", "origin"])
+        remote = f"origin/{branch}"
+        counts = self._git_ok(
+            ["rev-list", "--left-right", "--count", f"{remote}...{branch}"],
+            check=False,
+        )
+        if counts.returncode == 0:
+            behind, _, ahead = counts.stdout.strip().partition("\t")
+            behind, ahead = int(behind or 0), int(ahead or 0)
+            if ahead and behind:
+                self._log(
+                    f"push: rebasing {ahead} unpublished commit(s) onto "
+                    f"{behind} new remote commit(s) before pushing"
+                )
+                self._git_ok(["rebase", "--quiet", remote])
         self._git_ok(["push", "--quiet", "origin", branch])
 
     # ------------------------------------------------------------------ #

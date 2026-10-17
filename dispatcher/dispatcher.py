@@ -287,6 +287,11 @@ class Dispatcher:
                 "error",
                 f"control sync failed: {exc} — aborting tick (no dispatch on stale inbox)",
             )
+            # A failed sync means the dispatcher is blind: no new tasks are
+            # seen and no outcomes are published while it looks "ok" to the
+            # scheduler. Surface it as a tick-level incident (same class as a
+            # failed outcome publish) instead of silently ticking on stale state.
+            report.sync_failed = True
             return report
 
         inbox: Inbox
@@ -382,6 +387,11 @@ class Dispatcher:
         except Exception as exc:
             report.errors.append(f"outcome reporting failed: {exc}")
             self.log("error", f"outcome reporting failed: {exc}")
+            # A failed outcome publish leaves records only locally and wedges
+            # the next tick's ff-only sync — this is a tick-level incident,
+            # not a task failure, so surface it to the scheduler (visible
+            # failure instead of a silently stale control repo).
+            report.push_failed = True
         return report
 
     # --- state seeding --------------------------------------------------------
@@ -761,7 +771,15 @@ class _Git:
         return r.stdout.strip()
 
     def push(self) -> None:
-        self._run("push", "origin", "HEAD")
+        r = self._run("push", "origin", "HEAD")
+        if r.returncode != 0:
+            # A rejected push (e.g. non-fast-forward from a competing writer)
+            # must be visible: returning a SHA that lives only locally makes
+            # the task look published when it is not.
+            raise RuntimeError(
+                f"git push origin HEAD rejected (rc={r.returncode}): "
+                f"{(r.stderr or r.stdout).strip()[:300]}"
+            )
 
 
 def _default_logger():
