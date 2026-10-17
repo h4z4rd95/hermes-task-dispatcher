@@ -16,11 +16,21 @@ set -uo pipefail
 #   No-op on hosts without the file; the .env may have CRLF endings, so strip
 #   CRs in a temp copy instead of sourcing it directly.
 if [ -f "$HOME/.hermes/.env" ]; then
+  # FIX 2026-10-17 (cron unbound variable): The .env contains values with literal
+  # $ characters (e.g. scrypt$16384$8$1$... password hashes) that bash would expand
+  # during sourcing. Under `set -u` (line 10), $1/$8 in those values triggers
+  # "unbound variable" and kills every tick. Extract only the keys the dispatcher
+  # needs, using parameter expansion (which does NOT re-expand $ in values) instead
+  # of sourcing the whole file.
   set -a
   _env_clean="$(mktemp)"
   tr -d '\r' < "$HOME/.hermes/.env" > "$_env_clean"
-  # shellcheck source=/dev/null
-  . "$_env_clean"
+  while IFS= read -r _env_line || [ -n "$_env_line" ]; do
+    case "$_env_line" in
+      GITHUB_TOKEN=*) export "GITHUB_TOKEN=${_env_line#GITHUB_TOKEN=}";;
+      GH_TOKEN=*)     export "GH_TOKEN=${_env_line#GH_TOKEN=}";;
+    esac
+  done < "$_env_clean"
   rm -f "$_env_clean"
   set +a
 fi
