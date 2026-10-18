@@ -677,8 +677,29 @@ class VerificationGate:
             if na is not None:
                 return na
         changed = git.changed_since(self.baseline_sha or "HEAD~1")
+        if not changed:
+            # Empty diff: nothing was changed in the workspace, so there is
+            # genuinely nothing to verify for this tier. This is a
+            # not-applicable result that collapses to PASS (governance: a
+            # required set that collapsed entirely to not-applicable is a
+            # PASS), e.g. repo-backed echo tasks. A non-empty diff with no
+            # mappable tests stays PARTIAL (fail-closed) per the governance
+            # tests.
+            return CheckResult(
+                check_id="targeted_tests",
+                status="PARTIAL",
+                command="(none selected)",
+                output="no changes to verify",
+                skip_reason="not applicable: no changes in the workspace",
+                started_at=started,
+            )
+        # Only Python files can be pytest targets: a markdown or json file
+        # whose *name* contains "test" (task notes, evidence reports) made
+        # pytest exit 4 (usage error), which the verdict read as FAIL even
+        # though no test had failed.
         test_files = [
-            p for p in changed if "test" in Path(p).name.lower() or p.endswith(("test.py", "tests.py"))
+            p for p in changed
+            if p.endswith(".py") and "test" in Path(p).name.lower()
         ]
         if not test_files:
             # no test touched by the diff: map source modules to their tests

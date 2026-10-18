@@ -420,6 +420,7 @@ class Dispatcher:
     def _run_task(self, task: Task, state, report: TickReport) -> None:
         self.log("info", f"{task.id}: claiming → RUNNING (attempt {state.attempts})")
         checkout_path: Path | None = None
+        task_baseline_sha = ""
         if task.needs_checkout:
             checkout = self.workspace.checkout(
                 task_id=task.id,
@@ -433,6 +434,20 @@ class Dispatcher:
             state.workspace_path = str(checkout_path)
             state.session_id = state.session_id or ""
             self.store.upsert(state)
+            # Verification-gate baseline: the commit the workspace sat on
+            # *before* the agent ran. Shallow (depth=1) checkouts have no
+            # HEAD~1, so the gate cannot derive this itself; without an
+            # explicit baseline it treats every tracked file as changed and
+            # gates no-commit tasks on unrelated repository tests.
+            try:
+                _base = subprocess.run(
+                    ["git", "-C", str(checkout_path), "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                task_baseline_sha = _base.stdout.strip() if _base.returncode == 0 else ""
+            except Exception as exc:
+                self.log("warn", f"{task.id}: baseline rev-parse failed: {exc}")
+                task_baseline_sha = ""
 
         try:
             prompt = task.resolved_prompt(self.cfg.control_repo)
@@ -518,7 +533,7 @@ class Dispatcher:
                 prompt_text=prompt,
                 criteria=list(getattr(task, "acceptance_criteria", []) or []),
                 cache_path=self.cfg.state_dir / "verification_cache.json",
-                baseline_sha="",
+                baseline_sha=task_baseline_sha,
                 branch=task.branch,
                 # Only tasks that actually check out a repository are gated on
                 # repository-based checks. Prompt-only tasks (no repo) run with

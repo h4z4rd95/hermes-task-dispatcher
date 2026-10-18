@@ -144,10 +144,59 @@ def test_t1_with_no_applicable_tests_is_partial_not_done(tmp_path):
     write(repo, "docs/notes.md", "notes2\n")
     commit(repo, "change")
 
-    gate = gate_for(tmp_path, risk_tier="T1", repo_path=repo)
+    gate = gate_for(tmp_path, risk_tier="T1")
     bundle = gate.run()
     # no tests map to a docs-only change at T1 → PARTIAL, never PASS
     assert bundle.status == "PARTIAL"
+    tt = next(c for c in bundle.checks if c["check_id"] == "targeted_tests")
+    assert tt["skip_reason"] == "no targeted tests applicable"
+
+
+def test_t1_empty_diff_is_not_applicable_and_passes(tmp_path):
+    # Regression (2026-10-18): a workspace with no changes at all (e.g. a
+    # repo-backed echo task; shallow clones where the worker never commits)
+    # must be not-applicable at T1, collapsing to PASS — not PARTIAL/FAILED.
+    repo = make_repo(tmp_path)
+    write(repo, "dispatcher/mod.py", "def f():\n    return 1\n")
+    write(repo, "tests/test_mod.py", "def test_f():\n    assert True\n")
+    head = commit(repo, "init")
+
+    gate = gate_for(tmp_path, risk_tier="T1", baseline_sha=head)
+    bundle = gate.run()
+
+    assert bundle.status == "PASS"
+    assert bundle.changed_files == []
+    tt = next(c for c in bundle.checks if c["check_id"] == "targeted_tests")
+    assert tt["status"] == "PARTIAL"
+    assert tt["skip_reason"].startswith("not applicable")
+
+
+def test_targeted_tests_never_selects_non_python_files(tmp_path):
+    # Regression (2026-10-18): markdown task notes whose *name* contains
+    # "test" were handed to pytest, which exits 4 (usage error); the verdict
+    # read that as a test failure. Only .py files are pytest targets.
+    repo = make_repo(tmp_path)
+    write(repo, "dispatcher/mod.py", "def f():\n    return 1\n")
+    write(repo, "tests/test_mod.py", "def test_f():\n    assert True\n")
+    commit(repo, "init")
+    write(repo, "prompts/task_a_live_test_notes.md", "# notes\n")
+    write(repo, "test/GITHUB_SMOKE_TEST.md", "# smoke doc\n")
+    write(repo, "dispatcher/mod.py", "def f():\n    return 2\n")
+    commit(repo, "change")
+
+    calls: list[list[str]] = []
+
+    def runner(files):
+        calls.append(list(files))
+        return 0
+
+    gate = gate_for(tmp_path, risk_tier="T1")
+    bundle = gate.run(test_runner=runner)
+
+    assert bundle.status == "PASS"
+    assert calls == [["tests/test_mod.py"]], "markdown files must never reach pytest"
+    for files in calls:
+        assert all(f.endswith(".py") for f in files)
 
 
 # --- 3: reuse of valid evidence without rerunning ---------------------------
