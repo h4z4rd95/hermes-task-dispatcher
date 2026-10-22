@@ -138,18 +138,101 @@ def test_t1_code_edit_selects_targeted_tests(tmp_path):
 
 
 def test_t1_with_no_applicable_tests_is_partial_not_done(tmp_path):
+    # A *code* change that maps to no test files is not proven: PARTIAL,
+    # fail-closed, never DONE (Issue #43 keeps this behavior — only diffs
+    # with no testable code at all collapse to not-applicable).
+    repo = make_repo(tmp_path)
+    write(repo, "pkg/orphan.py", "def f():\n    return 1\n")
+    commit(repo, "init")
+    write(repo, "pkg/orphan.py", "def f():\n    return 2\n")
+    commit(repo, "change")
+
+    gate = gate_for(tmp_path, risk_tier="T1", repo_path=repo)
+    bundle = gate.run()
+    assert bundle.status == "PARTIAL"
+    tt = next(c for c in bundle.checks if c["check_id"] == "targeted_tests")
+    assert tt["status"] == "PARTIAL"
+    assert tt["skip_reason"] == "no targeted tests applicable"
+
+
+def test_t1_docs_only_diff_is_not_applicable_and_passes(tmp_path):
+    # Regression (Issue #43): a docs/data-only diff has no testable code, so
+    # the targeted_tests check is explicitly not-applicable — a PARTIAL that
+    # collapses to PASS — not a false test failure that fences every
+    # docs-only task out of DONE.
     repo = make_repo(tmp_path)
     write(repo, "docs/notes.md", "notes\n")
     commit(repo, "init")
     write(repo, "docs/notes.md", "notes2\n")
     commit(repo, "change")
 
-    gate = gate_for(tmp_path, risk_tier="T1")
+    gate = gate_for(tmp_path, risk_tier="T1", repo_path=repo)
     bundle = gate.run()
-    # no tests map to a docs-only change at T1 → PARTIAL, never PASS
-    assert bundle.status == "PARTIAL"
+
+    assert bundle.status == "PASS"
     tt = next(c for c in bundle.checks if c["check_id"] == "targeted_tests")
-    assert tt["skip_reason"] == "no targeted tests applicable"
+    assert tt["status"] == "PARTIAL"
+    assert tt["skip_reason"].startswith("not applicable")
+    assert "no testable code paths" in tt["skip_reason"]
+
+
+def test_t1_targeted_test_failure_stays_fail(tmp_path):
+    # Issue #43 (a): a failing applicable test run must remain FAIL — the
+    # not-applicable classification must never mask a real test failure.
+    repo = make_repo(tmp_path)
+    write(repo, "dispatcher/mod.py", "def f():\n    return 1\n")
+    write(repo, "tests/test_mod.py", "def test_f():\n    assert False\n")
+    commit(repo, "init")
+    write(repo, "dispatcher/mod.py", "def f():\n    return 2\n")
+    commit(repo, "change")
+
+    def runner(files):
+        return 1  # a test ran and failed
+
+    gate = gate_for(tmp_path, risk_tier="T1", repo_path=repo)
+    bundle = gate.run(test_runner=runner)
+
+    assert bundle.status == "FAIL"
+    tt = next(c for c in bundle.checks if c["check_id"] == "targeted_tests")
+    assert tt["status"] == "FAIL"
+    assert tt["exit_code"] == 1
+
+
+def test_t1_missing_test_runner_is_blocked_not_failed(tmp_path, monkeypatch):
+    # Regression (Issue #43): when the default runner (the dispatcher's own
+    # interpreter) cannot execute pytest at all, the nonzero exit used to be
+    # recorded as a test FAILURE — a false failure. It must be BLOCKED with a
+    # named reason (owner action: install the runner), while staying
+    # fail-closed: never DONE.
+    import dispatcher.verification_gate as vg
+
+    repo = make_repo(tmp_path)
+    write(repo, "dispatcher/mod.py", "def f():\n    return 1\n")
+    write(repo, "tests/test_mod.py", "def test_f():\n    assert True\n")
+    commit(repo, "init")
+    write(repo, "dispatcher/mod.py", "def f():\n    return 2\n")
+    commit(repo, "change")
+
+    def fake_run(cmd, cwd=None, timeout=60):
+        # The gate's git plumbing shares the same _run seam; only the pytest
+        # invocations may fail here.
+        if cmd[:1] == ["git"]:
+            return real_run(cmd, cwd=cwd, timeout=timeout)
+        return 1, "/usr/bin/python3: No module named pytest"
+
+    real_run = vg._run
+    monkeypatch.setattr(vg, "_run", fake_run)
+
+    gate = gate_for(tmp_path, risk_tier="T1", repo_path=repo)
+    bundle = gate.run()
+
+    assert bundle.status == "BLOCKED"
+    tt = next(c for c in bundle.checks if c["check_id"] == "targeted_tests")
+    assert tt["status"] == "BLOCKED"
+    assert "No module named pytest" in tt["skip_reason"]
+    assert "test runner unavailable" in tt["skip_reason"]
+    assert bundle.blockers == [tt["skip_reason"]]
+
 
 
 def test_t1_empty_diff_is_not_applicable_and_passes(tmp_path):

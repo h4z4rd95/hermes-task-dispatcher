@@ -92,6 +92,10 @@ class OutcomeRecord:
     commit_sha: str | None = None
     blocker: str | None = None
     owner_action: str | None = None
+    # Identity of the run this outcome belongs to (Issue #43): publication is
+    # idempotent per run, so a resume/retry run reaching the same terminal
+    # status still lands in the ledger exactly once. Absent on legacy lines.
+    run_id: str = ""
 
 
 class ControlRepo:
@@ -166,6 +170,7 @@ class ControlRepo:
         commit_sha: str | None = None,
         blocker: str | None = None,
         owner_action: str | None = None,
+        run_id: str = "",
     ) -> str | None:
         """Record a finished task.
 
@@ -174,10 +179,13 @@ class ControlRepo:
         ``hermes/dispatch_outcomes.jsonl``, then commits everything and
         returns the new commit SHA. ``None`` when nothing changed.
 
-        Idempotent per ``(task_id, terminal status)``: appending the same
-        outcome twice writes the same ledger file and produces no commit.
-        Non-terminal statuses (``RUNNING`` etc.) are always recorded, since a
-        task can pass through them more than once across retries.
+        Idempotent per ``(task_id, terminal status, run)``: appending the same
+        outcome of the same run twice writes the same ledger file and produces
+        no commit. A *different* run (a resume/retry that reached the same
+        terminal status) is a new line — the ledger records every terminal
+        run exactly once (Issue #43). Non-terminal statuses (``RUNNING`` etc.)
+        are always recorded, since a task can pass through them more than once
+        across retries.
         """
         if not task_id:
             raise ControlRepoError("task_id is required")
@@ -193,6 +201,7 @@ class ControlRepo:
             commit_sha=commit_sha,
             blocker=blocker,
             owner_action=owner_action,
+            run_id=run_id or "",
         )
 
         changed = self._append_outcome(record)
@@ -393,21 +402,31 @@ class ControlRepo:
         return out
 
     def _append_outcome(self, record: OutcomeRecord) -> bool:
-        """Append one ledger line unless it is already there.
+        """Append one ledger line unless the same run is already recorded.
 
-        Idempotency key: ``(task_id, status)`` where *status* is terminal. A
-        terminal pair already present in the ledger means this outcome was
-        recorded before (a retry re-reporting the same terminal result, or a
-        tick re-ingesting an outcome file) and is skipped. Non-terminal
-        statuses are always appended — a task legitimately visits ``RUNNING``
-        once per attempt.
+        Idempotency key for a terminal status: ``(task_id, status, run_id)``
+        when the record carries a run identity (Issue #43). Keying on the run
+        — not on ``(task_id, status)`` alone — means a resume/retry run of the
+        same task reaching the same terminal status is still published, while
+        a re-report of the *same* run stays deduplicated. Records without a
+        run identity (legacy ledger lines, seeded rows) keep the old
+        ``(task_id, status)`` dedup. Non-terminal statuses are always
+        appended — a task legitimately visits ``RUNNING`` once per attempt.
         """
         path = self._outcomes_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = self._read_ledger()
         if _is_terminal(record.status):
             for prior in existing:
-                if prior.task_id == record.task_id and prior.status == record.status:
+                if prior.task_id != record.task_id or prior.status != record.status:
+                    continue
+                if record.run_id and prior.run_id == record.run_id:
+                    self._log(
+                        f"outcome {record.task_id}/{record.status} run "
+                        f"{record.run_id[:8]} already recorded; skipping"
+                    )
+                    return False
+                if not record.run_id and not prior.run_id:
                     self._log(
                         f"outcome {record.task_id}/{record.status} already "
                         f"recorded; skipping"
@@ -506,6 +525,8 @@ def _record_to_obj(record: OutcomeRecord) -> dict[str, Any]:
         obj["blocker"] = record.blocker
     if record.owner_action is not None:
         obj["owner_action"] = record.owner_action
+    if record.run_id:
+        obj["run_id"] = record.run_id
     return obj
 
 
@@ -519,6 +540,7 @@ def _record_from_obj(obj: dict[str, Any]) -> OutcomeRecord:
         commit_sha=obj.get("commit_sha"),
         blocker=obj.get("blocker"),
         owner_action=obj.get("owner_action"),
+        run_id=obj.get("run_id", "") or "",
     )
 
 

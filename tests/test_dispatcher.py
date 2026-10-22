@@ -48,7 +48,9 @@ class FakeRouter:
         if session_name in self.fail_on:
             raise RuntimeError("router boom")
         if self.runs:
-            return self.runs[min(self._n, len(self.runs) - 1)]
+            run = self.runs[min(self._n, len(self.runs) - 1)]
+            self._n += 1
+            return run
         self._n += 1
         return FakeRun(resumed=self._n > 1)
 
@@ -108,6 +110,7 @@ class FakeControl:
         summary: str,
         evidence,
         commit_sha: str | None = None,
+        run_id: str = "",
     ) -> str | None:
         self.written.append(
             {
@@ -116,6 +119,7 @@ class FakeControl:
                 "summary": summary,
                 "evidence": list(evidence) if evidence else [],
                 "commit_sha": commit_sha,
+                "run_id": run_id,
             }
         )
         return "outcome-commit-sha"
@@ -238,6 +242,41 @@ def test_terminal_task_is_not_reclaimed(env):
     report = d.tick()
     assert report.claimed == []
     assert router.calls == [] or len(router.calls) == 1
+
+
+def test_resume_run_publishes_its_own_outcome_with_new_run_id(env):
+    """Issue #43: a task that FAILED, was re-armed (inbox row + state row) and
+    completed on its second run must publish a second ledger write carrying a
+    fresh run identity — not be swallowed by the old (task, status) dedup."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    router.runs = [FakeRun(exit_code=1, stdout="first run failed"),
+                   FakeRun(exit_code=0, stdout="second run ok")]
+    task = Task(id="T-1", title="Resume", prompt_inline="p", session="res-1")
+    _write_inbox(control, [task])
+
+    report = d.tick()
+    assert report.claimed == ["T-1"]
+    assert store.get("T-1").status == "FAILED"
+    first = control_repo.written[-1]
+    assert first["status"] == "FAILED"
+    assert first["run_id"]
+
+    # Cadence of the real queue: the next tick ingests the spooled outcome
+    # file as an idempotent duplicate (already terminal) and drops it, before
+    # the owner re-arms the row.
+    d.tick()
+
+    # Owner re-arm: inbox row back to READY, state row reset.
+    _write_inbox(control, [task])
+    store.reset_to_ready("T-1", note="owner re-arm")
+
+    report2 = d.tick()
+    assert report2.claimed == ["T-1"]
+    assert store.get("T-1").status == "DONE"
+    second = control_repo.written[-1]
+    assert second["status"] == "DONE"
+    assert second["run_id"]
+    assert second["run_id"] != first["run_id"]
 
 
 def test_dependency_blocks_dependent_task(env):

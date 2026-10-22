@@ -713,6 +713,11 @@ class Dispatcher:
                     summary=state.outcome_summary or "",
                     evidence=(),
                     commit_sha=state.commit_sha or "",
+                    # Key the ledger line on the run (Issue #43): a
+                    # resume/retry run of the same task reaching the same
+                    # terminal status is published as its own line, while a
+                    # re-report of the same run is still deduplicated.
+                    run_id=state.run_id or "",
                 )
                 if got:
                     sha = got

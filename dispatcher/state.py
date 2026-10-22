@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,6 +119,12 @@ class TaskState:
     outcome_summary: str = ""
     outcome_json: str = ""
     session_id: str = ""
+    # Unique identity of the *run* that claimed this row, set on every claim.
+    # Terminal outcome publication keys on this (Issue #43): a resume/retry
+    # run gets a fresh id so its terminal outcome is published once, while a
+    # re-report of the same run is still deduplicated downstream. Empty for
+    # rows seeded without a claim and for ledgers written before this field.
+    run_id: str = ""
     workspace_path: str = ""
     commit_sha: str = ""
     # Last reason this task was skipped (not claimable) at eligibility check.
@@ -138,6 +145,7 @@ class TaskState:
             "outcome_summary": self.outcome_summary,
             "outcome_json": self.outcome_json,
             "session_id": self.session_id,
+            "run_id": self.run_id,
             "workspace_path": self.workspace_path,
             "commit_sha": self.commit_sha,
             "last_skip_reason": self.last_skip_reason,
@@ -157,6 +165,7 @@ class TaskState:
             outcome_summary=row["outcome_summary"] or "",
             outcome_json=row["outcome_json"] or "",
             session_id=row["session_id"] or "",
+            run_id=row["run_id"] if "run_id" in row.keys() else "",
             workspace_path=row["workspace_path"] or "",
             commit_sha=row["commit_sha"] or "",
             last_skip_reason=row["last_skip_reason"] if "last_skip_reason" in row.keys() else "",
@@ -176,6 +185,7 @@ CREATE TABLE IF NOT EXISTS task_state (
     outcome_summary TEXT NOT NULL DEFAULT '',
     outcome_json    TEXT NOT NULL DEFAULT '',
     session_id      TEXT NOT NULL DEFAULT '',
+    run_id          TEXT NOT NULL DEFAULT '',
     workspace_path  TEXT NOT NULL DEFAULT '',
     commit_sha      TEXT NOT NULL DEFAULT '',
     last_skip_reason TEXT NOT NULL DEFAULT '',
@@ -215,6 +225,18 @@ class StateStore:
             try:
                 conn.execute(
                     "ALTER TABLE task_state ADD COLUMN last_skip_reason "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass
+            # run_id (Issue #43): identity of the run that claimed the row,
+            # so terminal outcome publication is idempotent per run instead
+            # of per (task, status) — a resume run is a new run. Additive and
+            # idempotent; rows written by older code keep '' and are handled
+            # by the legacy dedup path downstream.
+            try:
+                conn.execute(
+                    "ALTER TABLE task_state ADD COLUMN run_id "
                     "TEXT NOT NULL DEFAULT ''"
                 )
             except sqlite3.OperationalError:
@@ -269,12 +291,17 @@ class StateStore:
         pid, started = lease_fingerprint()
         now = _now()
         expiry = now + max(lease_seconds, 1)
+        # A fresh run identity for this claim: the terminal outcome of this
+        # run is published keyed on it (Issue #43), so a resume/retry run of
+        # the same task is never mistaken for a re-report of a prior run.
+        run_id = uuid.uuid4().hex
         with self._conn() as conn:
             cur = conn.execute(
                 """
                 UPDATE task_state
                 SET status = 'RUNNING',
                     attempts = attempts + 1,
+                    run_id = ?,
                     lease_pid = ?,
                     lease_start = ?,
                     lease_expiry = ?,
@@ -283,7 +310,7 @@ class StateStore:
                 WHERE task_id = ?
                   AND status = 'READY'
                 """,
-                (pid, started, expiry, now, task_id),
+                (run_id, pid, started, expiry, now, task_id),
             )
             if cur.rowcount != 1:
                 return None

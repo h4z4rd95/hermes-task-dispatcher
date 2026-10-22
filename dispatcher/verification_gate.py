@@ -697,13 +697,11 @@ class VerificationGate:
         # whose *name* contains "test" (task notes, evidence reports) made
         # pytest exit 4 (usage error), which the verdict read as FAIL even
         # though no test had failed.
-        test_files = [
-            p for p in changed
-            if p.endswith(".py") and "test" in Path(p).name.lower()
-        ]
+        python_files = [p for p in changed if p.endswith(".py")]
+        test_files = [p for p in python_files if "test" in Path(p).name.lower()]
         if not test_files:
             # no test touched by the diff: map source modules to their tests
-            src = [p for p in changed if p.endswith(".py") and "test" not in Path(p).name.lower()]
+            src = [p for p in python_files if "test" not in Path(p).name.lower()]
             for s in src:
                 stem = Path(s).stem
                 cand = [
@@ -713,6 +711,25 @@ class VerificationGate:
                 ]
                 test_files += [c for c in cand if (self.repo_path / c).exists()]
         if not test_files:
+            if not python_files:
+                # Issue #43: a diff that carries no Python at all (docs,
+                # prompts, data) has nothing this check could ever run. It is
+                # explicitly not-applicable — a PARTIAL that collapses to PASS
+                # under the governance rule — not a false test failure. A diff
+                # that DOES touch code but maps to no test files stays
+                # fail-closed below: a code change with no applicable tests
+                # is not proven.
+                return CheckResult(
+                    check_id="targeted_tests",
+                    status="PARTIAL",
+                    command="(none selected)",
+                    output="diff carries no testable code paths",
+                    skip_reason=(
+                        "not applicable: no testable code paths in diff "
+                        "(docs/data only)"
+                    ),
+                    started_at=started,
+                )
             return CheckResult(
                 check_id="targeted_tests",
                 status="PARTIAL",
@@ -722,6 +739,23 @@ class VerificationGate:
                 skip_reason="no targeted tests applicable",
             )
         if runner is None:
+            # Issue #43: the default runner is the dispatcher's own
+            # interpreter. When pytest is genuinely unavailable under it, the
+            # runner exits nonzero before any test executes, which used to be
+            # recorded as a test FAILURE — a false failure that masks the real
+            # owner action (install the runner). Probe once and classify the
+            # missing runner as BLOCKED with a named reason; any other nonzero
+            # exit still means a test ran and failed (FAIL, never masked).
+            available, reason = self._default_runner_available()
+            if not available:
+                return CheckResult(
+                    check_id="targeted_tests",
+                    status="BLOCKED",
+                    command=self._runner_probe_cmd,
+                    output=reason,
+                    skip_reason=f"test runner unavailable: {reason}"[:200],
+                    started_at=started,
+                )
             runner = self._default_test_runner
         cmd = f"pytest {' '.join(test_files)}"
         try:
@@ -741,6 +775,29 @@ class VerificationGate:
             exit_code=code,
             output=f"ran {len(test_files)} targeted test file(s)",
             started_at=started,
+        )
+
+    _runner_probe_cmd = "sys.executable -m pytest --version"
+
+    def _default_runner_available(self) -> "tuple[bool, str]":
+        """Whether the default targeted-tests runner can execute at all.
+
+        A missing pytest (``No module named pytest``) makes the runner exit
+        nonzero before any test runs; without this probe the gate recorded
+        that as a test failure (Issue #43). Returns (available, reason) where
+        reason is a short human-readable diagnostic for the bundle.
+        """
+        code, out = _run(
+            [sys.executable, "-m", "pytest", "--version"],
+            cwd=self.repo_path,
+            timeout=120,
+        )
+        if code == 0:
+            return True, ""
+        detail = " ".join((out or "").split())[:160]
+        return False, (
+            f"{sys.executable} -m pytest --version exited {code}"
+            + (f" ({detail})" if detail else "")
         )
 
     def _default_test_runner(self, test_files: list[str]) -> int:

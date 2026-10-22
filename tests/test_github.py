@@ -344,6 +344,111 @@ def test_write_outcome_non_terminal_always_appends(repo):
     assert [r["summary"] for r in rows] == ["r1", "r2"]
 
 
+def _set_inbox_status_raw(repo, task_id, status):
+    """Flip one task's status line, as an owner re-arm would."""
+    path = repo / HERMES / "tasks_inbox.toml"
+    lines = path.read_text().splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.strip().startswith("status"):
+            lines[i] = f'status = "{status}"\n'
+            break
+    path.write_text("".join(lines))
+
+
+def test_write_outcome_publishes_each_terminal_run_once(repo):
+    """Issue #43: a resume run reaching the same terminal status is a new
+    ledger line; re-reporting the same run never duplicates it."""
+    write_inbox(repo)
+    sb = ScriptBuilder()
+    for _ in range(2):  # two writes that actually commit
+        sb.ok("add", "-A").ok("diff", "--cached", "--quiet", rc=1)
+        sb.ok("commit", "--quiet", "-m")
+    sb.head("c2")
+    cr = make_repo(repo, sb)
+
+    first = cr.write_outcome(
+        task_id="T-1", status="FAILED", summary="first run", evidence=[],
+        run_id="run-aaa",
+    )
+    assert first == "c2"
+    # Owner re-arms the inbox row (READY); the task runs again under a new
+    # run identity and reaches the same terminal status.
+    _set_inbox_status_raw(repo, "T-1", "READY")
+    second = cr.write_outcome(
+        task_id="T-1", status="FAILED", summary="resume run", evidence=[],
+        run_id="run-bbb",
+    )
+    assert second == "c2"
+    # A re-report of the *same* run publishes nothing new.
+    _set_inbox_status_raw(repo, "T-1", "READY")
+    third = cr.write_outcome(
+        task_id="T-1", status="FAILED", summary="resume run", evidence=[],
+        run_id="run-bbb",
+    )
+    assert third is None
+
+    rows = read_ledger(repo)
+    assert [r["summary"] for r in rows] == ["first run", "resume run"]
+    assert [r["run_id"] for r in rows] == ["run-aaa", "run-bbb"]
+
+
+def test_write_outcome_ledger_line_carries_run_id(repo):
+    write_inbox(repo)
+    sb = ScriptBuilder().ok("add", "-A").ok("diff", "--cached", "--quiet", rc=1)
+    sb.ok("commit", "--quiet", "-m").head("h")
+    cr = make_repo(repo, sb)
+    cr.write_outcome(
+        task_id="T-2026-10-05-001", status="DONE", summary="s", evidence=[],
+        run_id="run-xyz",
+    )
+    r0 = read_ledger(repo)[0]
+    assert r0["run_id"] == "run-xyz"
+
+
+def test_write_outcome_without_run_id_keeps_legacy_dedup(repo):
+    """Records carrying no run identity keep the old (task_id, status) dedup
+    so pre-Issue-43 callers and seeded rows behave exactly as before."""
+    write_inbox(repo)
+    sb = ScriptBuilder().ok("add", "-A").ok("diff", "--cached", "--quiet", rc=1)
+    sb.ok("commit", "--quiet", "-m").head("c1")
+    cr = make_repo(repo, sb)
+    first = cr.write_outcome(
+        task_id="T-2026-10-05-001", status="DONE", summary="s", evidence=[]
+    )
+    _set_inbox_status_raw(repo, "T-2026-10-05-001", "READY")
+    second = cr.write_outcome(
+        task_id="T-2026-10-05-001", status="DONE", summary="s", evidence=[]
+    )
+    assert first == "c1"
+    # The inbox was re-flipped so a commit still occurs; what must NOT happen
+    # is a second ledger line for the same terminal outcome.
+    assert second == "c1"
+    rows = read_ledger(repo)
+    assert len(rows) == 1
+    assert "run_id" not in rows[0]
+
+
+def test_write_outcome_new_run_appends_after_legacy_line(repo):
+    """A legacy line without run_id must not block a later identified run."""
+    write_inbox(repo)
+    sb = ScriptBuilder()
+    for _ in range(2):
+        sb.ok("add", "-A").ok("diff", "--cached", "--quiet", rc=1)
+        sb.ok("commit", "--quiet", "-m")
+    sb.head("c2")
+    cr = make_repo(repo, sb)
+    cr.write_outcome(task_id="T-1", status="FAILED", summary="legacy", evidence=[])
+    _set_inbox_status_raw(repo, "T-1", "READY")
+    cr.write_outcome(
+        task_id="T-1", status="FAILED", summary="new run", evidence=[],
+        run_id="run-new",
+    )
+    rows = read_ledger(repo)
+    assert [r["summary"] for r in rows] == ["legacy", "new run"]
+    assert rows[0].get("run_id", "") == ""
+    assert rows[1]["run_id"] == "run-new"
+
+
 def test_write_outcome_requires_task_id(repo):
     cr = make_repo(repo)
     with pytest.raises(ControlRepoError):
