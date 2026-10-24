@@ -343,11 +343,18 @@ class StateStore:
     # --- stale lease recovery ------------------------------------------------
 
     def stale_leases(self, *, stale_after_seconds: int) -> list[TaskState]:
-        """RUNNING tasks whose lease owner is dead or expired."""
+        """RUNNING tasks whose lease owner is dead or expired.
+
+        Rows without a lease fingerprint (owner hand-wrote status = "RUNNING"
+        in the inbox; never claimed by the dispatcher) are owner holds, not
+        crashed workers, and are never recovered automatically.
+        """
         now = _now()
         out: list[TaskState] = []
         for state in self.all_states().values():
             if state.status != "RUNNING":
+                continue
+            if state.lease_pid is None and state.lease_start is None:
                 continue
             expiry = state.lease_expiry or 0
             expired = now > (expiry + max(stale_after_seconds, 0))
@@ -433,6 +440,10 @@ class OutcomeRecord:
     blocker: str = ""
     owner_action: str = ""
     error: str = ""
+    # Provenance of the source task (registry Task.source): links the
+    # automated run back to its GitHub issue / spawning task. "" = owner
+    # hand-edited or legacy. Absent in pre-2026-10-24 spool files.
+    source: str = ""
     recorded_at: float = _now()
 
     def to_json(self) -> str:
@@ -450,6 +461,7 @@ class OutcomeRecord:
             "blocker": self.blocker,
             "owner_action": self.owner_action,
             "error":  self.error,
+            "source": self.source,
             "recorded_at": self.recorded_at,
         }
 
@@ -466,6 +478,7 @@ class OutcomeRecord:
             blocker=d.get("blocker", ""),
             owner_action=d.get("owner_action", ""),
             error=d.get("error", ""),
+            source=d.get("source", ""),
             recorded_at=d.get("recorded_at", _now()),
         )
 

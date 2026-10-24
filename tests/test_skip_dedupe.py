@@ -59,7 +59,7 @@ def test_repeated_pending_logged_once():
     for _ in range(3):
         d._eligible(pending_task(), None, store.all_states())
     assert len([m for _, m in logs if "PENDING" in m]) == 1
-    assert store.rows["T-PEND"].last_skip_reason == "status PENDING — not claimable yet"
+    assert store.rows["T-PEND"].last_skip_reason == "status PENDING — not claimable until the owner promotes it to READY"
 
 
 def test_reason_change_logged_once_then_quiet():
@@ -69,7 +69,7 @@ def test_reason_change_logged_once_then_quiet():
     logs.clear()
     store.rows["T-PEND"] = TaskState(
         task_id="T-PEND", status="READY",
-        last_skip_reason="status PENDING — not claimable yet")
+        last_skip_reason="status PENDING — not claimable until the owner promotes it to READY")
     d._eligible(approval_task(), None, store.all_states())
     assert len([m for _, m in logs if "approval" in m]) == 1
     logs.clear()

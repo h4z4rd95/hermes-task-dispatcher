@@ -41,10 +41,11 @@ _INT_FIELDS = {"priority", "workspace_budget_mb", "max_retries", "timeout_second
 _STR_FIELDS = {
     "id", "title", "status", "workstream", "repo", "branch", "prompt_path",
     "prompt_inline", "session", "session_affinity", "model", "approval_note",
-    "purpose", "result_note", "risk_tier",
+    "purpose", "result_note", "risk_tier", "source",
 }
 _DICT_FIELDS = {"runtime_probe"}
-_BOOL_FIELDS = {"parallel_safe", "keep_workspace", "requires_approval"}
+_BOOL_FIELDS = {"parallel_safe", "keep_workspace", "requires_approval",
+                "spawn_allowed"}
 _LIST_FIELDS = {"dependencies"}
 
 
@@ -83,6 +84,20 @@ class Task:
     model: str = ""
     purpose: str = ""
     result_note: str = ""
+    # Provenance of the task (T-2026-10-24 auto-intake owner control):
+    #   ""                  = owner hand-edited / legacy block (no tool trail)
+    #   "github-issue-<n>"  = registered by supervisor/intake/register_issue.py
+    #   "spawned-by:<task>" = auto-registered by a dispatcher-spawned agent
+    #                         whose task carried spawn_allowed = true
+    # The field is carried through to the outcome ledger so every automated
+    # run is linkable to its source issue / parent task.
+    source: str = ""
+    # Explicit allow-rule for recursion (T-2026-10-24 auto-intake owner
+    # control): only when true may the agent that this task spawns register
+    # further inbox tasks through the canonical intake path
+    # (supervisor/intake/register_issue.py checks this on the parent task).
+    # Off by default: dispatcher-spawned agents cannot chain-create tasks.
+    spawn_allowed: bool = False
 
     # Owner-recorded completion variants. The owner may mark a task
     # COMPLETED_PARTIAL (criteria partially met) rather than DONE; it is a
@@ -412,7 +427,7 @@ _ORDER = (
     "purpose", "prompt_path", "prompt_inline", "session", "session_affinity",
     "parallel_safe", "workspace_budget_mb", "keep_workspace", "requires_approval",
     "approval_note", "dependencies", "max_retries", "timeout_seconds", "model",
-    "result_note", "risk_tier", "runtime_probe",
+    "result_note", "risk_tier", "runtime_probe", "source", "spawn_allowed",
 )
 
 
@@ -455,8 +470,13 @@ def task_to_toml_block(task: Task) -> str:
             continue
         if key == "runtime_probe" and not value:
             continue
-            continue
         if key == "dependencies" and not value:
+            continue
+        # Provenance / allow-rule fields stay out of blocks that do not use
+        # them (backward-compatible, tight diffs).
+        if key == "source" and not value:
+            continue
+        if key == "spawn_allowed" and not value:
             continue
         lines.append(f"{key} = {_fmt_value(value)}")
     lines.append("")

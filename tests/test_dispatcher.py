@@ -36,6 +36,10 @@ class FakeRouter:
         self.calls: list[dict[str, Any]] = []
         self.fail_on = fail_on or set()
         self.runs = runs or []
+        # The real SessionRouter carries extra_env (merged into the child
+        # process environment); the dispatcher stamps the recursion-guard
+        # variables (DISPATCHER_TASK_DEPTH / DISPATCHER_TASK_ID) into it.
+        self.extra_env: dict[str, str] = {}
         self._n = 0
 
     def session_name_exists(self, name: str) -> bool:
@@ -111,6 +115,7 @@ class FakeControl:
         evidence,
         commit_sha: str | None = None,
         run_id: str = "",
+        source: str = "",
     ) -> str | None:
         self.written.append(
             {
@@ -120,6 +125,7 @@ class FakeControl:
                 "evidence": list(evidence) if evidence else [],
                 "commit_sha": commit_sha,
                 "run_id": run_id,
+                "source": source,
             }
         )
         return "outcome-commit-sha"
@@ -203,7 +209,9 @@ def test_pending_task_is_valid_but_not_claimed(env):
     assert report.inbox_tasks == 1
     assert report.claimed == []
     assert router.calls == []
-    assert store.get("T-PENDING").status == "READY"
+    # T-2026-10-24: the state row is seeded PENDING, not READY — the
+    # dispatcher must never silently promote an owner-set status.
+    assert store.get("T-PENDING").status == "PENDING"
 
 
 def test_ready_task_is_claimed_and_completes(env):
@@ -572,3 +580,91 @@ def test_workspace_log_bridge_accepts_function_logger():
     mgr._log.warning("warned %s", "now")
     assert any("hello world" in m for _, m in captured), captured
     assert any(l == "warn" for l, _ in captured), captured
+
+
+# --- T-2026-10-24 auto-intake owner control ---------------------------------
+
+
+def test_blocked_inbox_task_is_not_claimed(env):
+    """A BLOCKED inbox status is an owner hold: it must never be claimed.
+
+    Regression (Issue #48): before the fix only PENDING was checked, so a
+    task the owner marked BLOCKED was silently seeded READY and claimed.
+    """
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-BLK", title="Held by owner",
+                                prompt_inline="p", status="BLOCKED")])
+    report = d.tick()
+    assert report.claimed == []
+    assert router.calls == []
+    assert store.get("T-BLK").status == "BLOCKED"
+
+
+def test_running_inbox_task_is_owner_hold_not_reaped(env):
+    """A hand-written RUNNING inbox status has no dispatcher lease.
+
+    It is neither claimable (no silent execution) nor reaped (no silent
+    re-arm into READY by stale-lease recovery).
+    """
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-HOLD", title="Held",
+                                prompt_inline="p", status="RUNNING")])
+    report = d.tick()
+    assert report.claimed == []
+    assert report.recovered == []
+    assert router.calls == []
+    state = store.get("T-HOLD")
+    assert state.status == "RUNNING"
+    assert state.lease_pid is None
+    # A second tick (same store, same hold) must still leave it alone.
+    report2 = d.tick()
+    assert report2.claimed == []
+    assert report2.recovered == []
+    assert store.get("T-HOLD").status == "RUNNING"
+
+
+def test_worker_env_carry_spawn_depth_and_task_id(env, monkeypatch):
+    """Recursion guard: the spawned agent session is stamped with depth+1
+    and the parent task id so the canonical intake path can refuse
+    chain-creation without an explicit allow-rule."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    monkeypatch.delenv("DISPATCHER_TASK_DEPTH", raising=False)
+    _write_inbox(control, [Task(id="T-48", title="Spawn", prompt_inline="p")])
+    d.tick()
+    assert router.extra_env["DISPATCHER_TASK_DEPTH"] == "1"
+    assert router.extra_env["DISPATCHER_TASK_ID"] == "T-48"
+
+
+def test_worker_env_depth_increments_when_nested(env, monkeypatch):
+    d, cfg, store, router, workspace, control_repo, control = env
+    monkeypatch.setenv("DISPATCHER_TASK_DEPTH", "2")
+    _write_inbox(control, [Task(id="T-49", title="Nested spawn", prompt_inline="p")])
+    d.tick()
+    assert router.extra_env["DISPATCHER_TASK_DEPTH"] == "3"
+    assert router.extra_env["DISPATCHER_TASK_ID"] == "T-49"
+
+
+def test_outcome_carries_task_source(env):
+    """Every automated run is linkable to its source: the ledger write
+    carries the task's provenance (github-issue-<n> / spawned-by:<task>)."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-48", title="Traced", prompt_inline="p",
+                                source="github-issue-48")])
+    report = d.tick()
+    assert report.completed == ["T-48"]
+    written = [w for w in control_repo.written if w["task_id"] == "T-48"]
+    assert written and written[-1]["source"] == "github-issue-48"
+    # The spooled outcome file carries the same provenance.
+    spool = cfg.outcomes_dir / "T-48.json"
+    import json as _json
+    assert _json.loads(spool.read_text())["source"] == "github-issue-48"
+
+
+def test_outcome_source_absent_for_owner_hand_tasks(env):
+    """Legacy / owner hand-edited tasks (no source) publish ledger writes
+    without a source claim — nothing is invented."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-HAND", title="Hand", prompt_inline="p")])
+    d.tick()
+    written = [w for w in control_repo.written if w["task_id"] == "T-HAND"]
+    assert written and written[-1]["source"] == ""

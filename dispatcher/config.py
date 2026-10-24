@@ -89,6 +89,15 @@ class Config:
         env["DISPATCHER_HOME"] = str(self.home)
         env["DISPATCHER_CONTROL_REPO"] = str(self.control_repo)
         env["DISPATCHER_WORKSPACE_POOL"] = str(self.workspace_pool)
+        # Recursion-guard stamp (T-2026-10-24 auto-intake owner control):
+        # detached workers carry their spawn depth, so the canonical intake
+        # path (register_issue.py) can refuse chain-creation unless the
+        # parent task allows it.
+        try:
+            depth = int(os.environ.get("DISPATCHER_TASK_DEPTH", "0") or 0)
+        except ValueError:
+            depth = 0
+        env["DISPATCHER_TASK_DEPTH"] = str(depth + 1)
         return env
 
 

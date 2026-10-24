@@ -218,3 +218,38 @@ def test_completed_partial_is_terminal_but_not_claimable():
     inbox = parse_inbox(text)
     assert inbox.tasks[0].is_terminal is True
 
+
+
+# --- T-2026-10-24 auto-intake owner control: provenance + allow-rule --------
+
+
+def test_source_and_spawn_allowed_round_trip():
+    task = Task(id="T-48", title="x", prompt_inline="p",
+                source="github-issue-48", spawn_allowed=True)
+    block = task_to_toml_block(task)
+    assert 'source = "github-issue-48"' in block
+    assert "spawn_allowed = true" in block
+    parsed = parse_inbox(block).tasks[0]
+    assert parsed.source == "github-issue-48"
+    assert parsed.spawn_allowed is True
+
+
+def test_source_defaults_absent_and_backwards_compatible():
+    # Legacy blocks without the new fields still parse; the fields default
+    # off so nothing becomes spawn-eligible or falsely provenanced.
+    text = ("[[task]]\nid = \"T-LEGACY\"\ntitle = \"x\"\n"
+            "status = \"READY\"\nprompt_inline = \"p\"\n")
+    task = parse_inbox(text).tasks[0]
+    assert task.source == ""
+    assert task.spawn_allowed is False
+    # And a block that never used the fields serialises without them.
+    assert "source" not in task_to_toml_block(task)
+    assert "spawn_allowed" not in task_to_toml_block(task)
+
+
+def test_spawned_by_source_value_parses():
+    text = ("[[task]]\nid = \"T-49\"\ntitle = \"x\"\n"
+            "status = \"PENDING\"\nprompt_inline = \"p\"\n"
+            "source = \"spawned-by:T-48\"\n")
+    task = parse_inbox(text).tasks[0]
+    assert task.source == "spawned-by:T-48"

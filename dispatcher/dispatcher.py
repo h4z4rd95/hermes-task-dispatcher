@@ -181,10 +181,19 @@ class Dispatcher:
 
     def _eligible(self, task: Task, inbox: Inbox, states: dict) -> bool:
         state = states.get(task.id)
-        # PENDING is a valid inbox state but is deliberately not runnable.
-        # A task becomes dispatchable only when the owner promotes it to READY.
+        # The inbox status is the owner's execution gate and the ONLY status
+        # that is claimable is READY (contract: owner_controls.md). PENDING is
+        # parked until the owner promotes; BLOCKED and RUNNING are explicit
+        # holds. Nothing is ever promoted silently: the dispatcher writes
+        # terminal statuses back to the inbox and never READY.
         if task.status == "PENDING":
-            self._skip(task, state, "status PENDING — not claimable yet")
+            self._skip(task, state, "status PENDING — not claimable until the owner promotes it to READY")
+            return False
+        if task.status == "BLOCKED":
+            self._skip(task, state, "status BLOCKED — owner hold, not claimable")
+            return False
+        if task.status == "RUNNING":
+            self._skip(task, state, "status RUNNING in inbox — owner/agent hold, no dispatcher lease to recover")
             return False
         if task.requires_approval:
             self._skip(task, state, "requires owner approval — not claimable yet")
@@ -400,17 +409,21 @@ class Dispatcher:
         """Create state rows for inbox tasks the store has not seen.
 
         Returns the number of rows created. A task whose inbox status is
-        already terminal is seeded as terminal (and is therefore never
-        claimed); anything else is seeded READY so the atomic claim has a row
-        to update.
+        terminal is seeded terminal (and is therefore never claimed). A
+        non-terminal inbox status is seeded *as itself* (PENDING stays
+        PENDING, BLOCKED stays BLOCKED, a hand-written RUNNING stays a
+        RUNNING hold): the dispatcher must never silently promote an
+        owner-set status into a claimable READY.
         """
         created = 0
+        from .registry import STATES
+
         for task in inbox.tasks:
             if task.id in states:
                 continue
             from .state import TaskState
 
-            seed_status = task.status if task.is_terminal else "READY"
+            seed_status = task.status if (task.is_terminal or task.status in STATES) else "READY"
             self.store.upsert(TaskState(task_id=task.id, status=seed_status))
             created += 1
         return created
@@ -486,6 +499,21 @@ class Dispatcher:
                     f"remaining tick budget {int(remaining)}s",
                 )
                 run_budget_s = int(remaining)
+        # Recursion-guard stamp (T-2026-10-24 auto-intake owner control):
+        # every agent session the dispatcher spawns carries its spawn depth
+        # and parent task id in the environment. supervisor/intake/
+        # register_issue.py refuses --apply at depth >= 1 unless the parent
+        # task carries spawn_allowed = true, so dispatcher-spawned agents
+        # cannot chain-create inbox tasks without an explicit allow-rule.
+        try:
+            _depth = int(os.environ.get("DISPATCHER_TASK_DEPTH", "0") or 0)
+        except ValueError:
+            _depth = 0
+        _extra = getattr(self.router, "extra_env", None)
+        if isinstance(_extra, dict):
+            _extra["DISPATCHER_TASK_DEPTH"] = str(_depth + 1)
+            _extra["DISPATCHER_TASK_ID"] = task.id
+
         run = self.router.run(
             session_name=session_name,
             prompt=prompt,
@@ -606,6 +634,7 @@ class Dispatcher:
             commit_sha=commit_sha,
             session_id=run.session_id,
             workspace_path=str(checkout_path) if checkout_path else "",
+            source=task.source,
         ).write(self.cfg.outcomes_dir)
         if checkout_path is not None and not task.keep_workspace:
             try:
@@ -718,6 +747,11 @@ class Dispatcher:
                     # terminal status is published as its own line, while a
                     # re-report of the same run is still deduplicated.
                     run_id=state.run_id or "",
+                    # Provenance link (T-2026-10-24 auto-intake owner
+                    # control): the ledger row carries the task's source
+                    # (github-issue-<n> / spawned-by:<task> / "") so every
+                    # automated run is traceable to its origin.
+                    source=task.source,
                 )
                 if got:
                     sha = got
@@ -752,6 +786,12 @@ def _find_task(inbox: Inbox, task_id: str) -> Task | None:
 def _is_stale(state, stale_after_seconds: int) -> bool:
     from .state import pid_alive as _alive
 
+    # A RUNNING row with no lease was never claimed by the dispatcher (e.g.
+    # an owner hand-wrote status = "RUNNING" in the inbox). It is an owner
+    # hold, not a crashed worker: auto-recovery would silently re-arm it, so
+    # it is never stale. Claimed rows always carry a lease fingerprint.
+    if state.lease_pid is None and state.lease_start is None:
+        return False
     now = time.time()
     expired = now > (state.lease_expiry or 0) + max(stale_after_seconds, 0)
     alive = _alive(state.lease_pid or 0, state.lease_start)

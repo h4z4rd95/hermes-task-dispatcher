@@ -96,6 +96,11 @@ class OutcomeRecord:
     # idempotent per run, so a resume/retry run reaching the same terminal
     # status still lands in the ledger exactly once. Absent on legacy lines.
     run_id: str = ""
+    # Provenance of the source task (registry Task.source): links the run
+    # back to its GitHub issue / spawning task (T-2026-10-24 auto-intake
+    # owner control). Omitted from the line when empty, so legacy rows and
+    # owner hand-edited tasks stay byte-stable.
+    source: str = ""
 
 
 class ControlRepo:
@@ -171,6 +176,7 @@ class ControlRepo:
         blocker: str | None = None,
         owner_action: str | None = None,
         run_id: str = "",
+        source: str = "",
     ) -> str | None:
         """Record a finished task.
 
@@ -202,6 +208,7 @@ class ControlRepo:
             blocker=blocker,
             owner_action=owner_action,
             run_id=run_id or "",
+            source=source or "",
         )
 
         changed = self._append_outcome(record)
@@ -527,6 +534,8 @@ def _record_to_obj(record: OutcomeRecord) -> dict[str, Any]:
         obj["owner_action"] = record.owner_action
     if record.run_id:
         obj["run_id"] = record.run_id
+    if record.source:
+        obj["source"] = record.source
     return obj
 
 
@@ -541,6 +550,7 @@ def _record_from_obj(obj: dict[str, Any]) -> OutcomeRecord:
         blocker=obj.get("blocker"),
         owner_action=obj.get("owner_action"),
         run_id=obj.get("run_id", "") or "",
+        source=obj.get("source", "") or "",
     )
 
 
