@@ -116,6 +116,8 @@ class FakeControl:
         commit_sha: str | None = None,
         run_id: str = "",
         source: str = "",
+        attempt: int = 0,
+        reason: str = "",
     ) -> str | None:
         self.written.append(
             {
@@ -126,6 +128,8 @@ class FakeControl:
                 "commit_sha": commit_sha,
                 "run_id": run_id,
                 "source": source,
+                "attempt": attempt,
+                "reason": reason,
             }
         )
         return "outcome-commit-sha"
