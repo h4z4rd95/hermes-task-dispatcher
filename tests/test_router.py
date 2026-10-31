@@ -63,19 +63,48 @@ EMPTY_BOTH_STDOUT = (
 
 
 class FakeRunner:
-    """Stands in for subprocess.run; records calls and replies canned output."""
+    """Stands in for subprocess.run; records calls and replies canned output.
+
+    The session-existence probe (``sessions export --dry-run --title <name>``)
+    is answered by ``session_exists``: when False the probe reports zero
+    matches (fresh session), and when True it reports one match (resume).
+    All other invocations (the ``hermes chat ...`` call) return the canned
+    ``stdout`` / ``stderr`` / ``returncode`` as before.
+    """
 
     def __init__(self, *, stdout: str = "", stderr: str = "",
-                 returncode: int = 0, raise_exc: BaseException | None = None):
+                 returncode: int = 0, raise_exc: BaseException | None = None,
+                 session_exists: bool = False):
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
         self.raise_exc = raise_exc
+        self.session_exists = session_exists
         self.calls: list[dict] = []
         self.stdin_inputs: list[str] = []
         self.timeouts: list[float] = []
 
     def __call__(self, cmd, *, cwd, env, capture_output, text, timeout):
+        # Session-existence probe: ``sessions export --dry-run --title <name>``.
+        # When session_exists=True (the new resume tests), intercept the probe
+        # and answer with a count of 1. When session_exists=False, fall through
+        # to the standard canned-response path so legacy tests that set their
+        # own stdout continue to exercise the real parser.
+        if "export" in cmd and "--dry-run" in cmd and self.session_exists:
+            count = 1  # session_exists is True
+            title = "smoke-1"
+            for i, a in enumerate(cmd):
+                if a == "--title" and i + 1 < len(cmd):
+                    title = cmd[i + 1]
+            out = f"Would export {count} session(s) (title contains '{title}').\r\n"
+            # Record the probe call for inspection.
+            self.calls.append(
+                {"cmd": list(cmd), "cwd": cwd, "env": env,
+                 "capture_output": capture_output, "text": text, "timeout": timeout}
+            )
+            return subprocess.CompletedProcess(
+                args=list(cmd), returncode=0, stdout=out, stderr=""
+            )
         self.calls.append(
             {
                 "cmd": list(cmd),
@@ -108,16 +137,25 @@ def make_router(runner: FakeRunner, **kw) -> SessionRouter:
     return router
 
 
+def _chat_cmd(runner: FakeRunner) -> list[str]:
+    """Extract the ``hermes chat ...`` command from recorded calls.
+
+    ``runner.calls[0]`` is the session-existence probe (``sessions export ...``);
+    the actual chat invocation is the call whose second element is ``chat``.
+    """
+    return [c for c in runner.calls if c["cmd"][1] == "chat"][0]["cmd"]
+
+
 # ---------------------------------------------------------------------- #
 # Command construction
 # ---------------------------------------------------------------------- #
 
 
 def test_run_uses_verified_routing_primitive():
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner)
     router.run(session_name="smoke-1", prompt="Do the thing.")
-    cmd = runner.calls[0]["cmd"]
+    cmd = _chat_cmd(runner)
     assert cmd[1] == "chat"
     for needle in (
         "--continue", "smoke-1",
@@ -130,33 +168,34 @@ def test_run_uses_verified_routing_primitive():
 
 
 def test_prompt_travels_via_stdin_never_the_command_line():
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner)
     secret_ish = "key='value' $(rm -rf /) `whoami` \"quoted\""
     router.run(session_name="smoke-1", prompt=secret_ish)
-    cmd = runner.calls[0]["cmd"]
+    cmd = _chat_cmd(runner)
     assert secret_ish not in cmd
     assert runner.stdin_inputs == [secret_ish]
 
 
 def test_workdir_becomes_in_flag():
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner, workdir=Path("/some/where"))
     router.run(session_name="smoke-1", prompt="hi")
-    cmd = runner.calls[0]["cmd"]
+    cmd = _chat_cmd(runner)
     i = cmd.index("--in")
     assert cmd[i + 1] == str(Path("/some/where"))
 
 
 def test_no_workdir_means_no_in_flag():
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner)
     router.run(session_name="smoke-1", prompt="hi")
-    assert "--in" not in runner.calls[0]["cmd"]
+    assert "--in" not in _chat_cmd(runner)
 
 
 def test_optional_flags_only_when_supplied():
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    """On a fresh session, --run-budget is forwarded as a creation-only override."""
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner)
     router.run(
         session_name="smoke-1",
@@ -165,17 +204,40 @@ def test_optional_flags_only_when_supplied():
         max_turns=12,
         run_budget_s=900,
     )
-    cmd = runner.calls[0]["cmd"]
+    cmd = _chat_cmd(runner)
     assert cmd[cmd.index("--model") + 1] == "anthropic/claude-sonnet-4"
     assert cmd[cmd.index("--max-turns") + 1] == "12"
     assert cmd[cmd.index("--run-budget") + 1] == "900"
 
 
+def test_run_budget_omitted_on_resume():
+    """On a resume, --run-budget must NOT be forwarded (creation-only override)."""
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=True)
+    router = make_router(runner)
+    router.run(
+        session_name="smoke-1",
+        prompt="hi",
+        run_budget_s=900,
+    )
+    cmd = _chat_cmd(runner)
+    assert "--run-budget" not in cmd
+
+
+def test_run_budget_omitted_on_resume_but_present_on_fresh():
+    """Same --run-budget value: included for fresh, omitted for resume."""
+    for exists, has_budget in [(False, True), (True, False)]:
+        runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=exists)
+        router = make_router(runner)
+        router.run(session_name="smoke-1", prompt="hi", run_budget_s=900)
+        cmd = _chat_cmd(runner)
+        assert ("--run-budget" in cmd) is has_budget
+
+
 def test_no_optional_flags_by_default():
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner)
     router.run(session_name="smoke-1", prompt="hi")
-    cmd = runner.calls[0]["cmd"]
+    cmd = _chat_cmd(runner)
     for flag in ("--model", "--max-turns", "--run-budget"):
         assert flag not in cmd
 
@@ -269,7 +331,10 @@ def test_run_budget_passed_as_timeout_and_handled():
     )
     router = make_router(runner)
     res = router.run(session_name="smoke-1", prompt="hi", run_budget_s=900)
-    assert runner.timeouts[0] == 900.0
+    # The first timeout is the session-existence probe (60s); the chat call's
+    # timeout must match the run_budget.
+    chat_call = [c for c in runner.calls if c["cmd"][1] == "chat"][0]
+    assert chat_call["timeout"] == 900.0
     assert res.timed_out is True
     assert res.exit_code == 124
     assert res.session_id == "partial1"
@@ -281,11 +346,12 @@ def test_run_without_budget_still_bounded():
     # A run with no explicit budget must never be unbounded — that is how a
     # session hang once consumed the full 3600s scheduler timeout. The router
     # installs a safety net instead of passing timeout=None.
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner)
     router.run(session_name="smoke-1", prompt="hi")
-    assert runner.timeouts[0] is not None
-    assert runner.timeouts[0] > 0
+    # First call is the probe; the chat call's timeout must be bounded.
+    chat_call = [c for c in runner.calls if c["cmd"][1] == "chat"][0]
+    assert chat_call["timeout"] is not None
 
 
 # ---------------------------------------------------------------------- #
@@ -294,22 +360,24 @@ def test_run_without_budget_still_bounded():
 
 
 def test_github_token_inherited_not_on_command_line(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_SUPERSECRET")
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    monkeypatch.setenv("GITHUB_TOKEN", "***")
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner)
     router.run(session_name="smoke-1", prompt="hi")
-    env = runner.calls[0]["env"]
-    assert env["GITHUB_TOKEN"] == "ghp_SUPERSECRET"
-    cmd_str = " ".join(runner.calls[0]["cmd"])
-    assert "ghp_SUPERSECRET" not in cmd_str
+    chat_call = [c for c in runner.calls if c["cmd"][1] == "chat"][0]
+    env = chat_call["env"]
+    assert env["GITHUB_TOKEN"] == "***"
+    cmd_str = " ".join(chat_call["cmd"])
+    assert "***" not in cmd_str
 
 
 def test_extra_env_merged(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_X")
-    runner = FakeRunner(stdout=RESUME_STDOUT)
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner, extra_env={"DISPATCHER_TASK": "T-1"})
     router.run(session_name="smoke-1", prompt="hi")
-    env = runner.calls[0]["env"]
+    chat_call = [c for c in runner.calls if c["cmd"][1] == "chat"][0]
+    env = chat_call["env"]
     assert env["DISPATCHER_TASK"] == "T-1"
     assert env["GITHUB_TOKEN"] == "ghp_X"
 

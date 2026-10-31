@@ -391,11 +391,15 @@ class SessionRouter:
             )
         new_cli = bool(_NEW_SESSION_FLAGS_SUPPORTED)
 
-        # Only the legacy (v0.19.x) path needs to know whether the session
-        # exists: --create-if-missing handles both cases on newer builds.
-        session_exists = None
-        if not new_cli:
-            session_exists = self.session_name_exists(session_name)
+        # Probe whether the session already exists so we can decide which
+        # creation-only flags to forward. On new-CLI builds --create-if-missing
+        # handles create-vs-resume transparently, but creation-only overrides
+        # like --run-budget must NOT be sent on a resume (the gateway freezes the
+        # launch route and refuses differing creation overrides). --run-budget
+        # is a creation-only override; omitting it on a resume is the root-cause
+        # fix for the Oct-31 resume failure (Issue #64).
+        session_exists = self.session_name_exists(session_name)
+        is_fresh = not bool(session_exists)
 
         cmd = self._build_cmd(
             session_name=session_name,
@@ -403,11 +407,13 @@ class SessionRouter:
             max_turns=max_turns,
             run_budget_s=run_budget_s,
             resume_by_name=bool(session_exists),
+            is_fresh=is_fresh,
         )
         self._log(
             f"run session={session_name!r} model={model or 'default'} "
             f"max_turns={max_turns} budget={run_budget_s}s "
-            f"workdir={self.workdir!s} resume_by_name={session_exists}"
+            f"workdir={self.workdir!s} resume_by_name={session_exists} "
+            f"is_fresh={is_fresh}"
         )
 
         _PROMPT_HOLDER[0] = prompt
@@ -489,6 +495,7 @@ class SessionRouter:
         max_turns: int | None,
         run_budget_s: int | None,
         resume_by_name: bool = True,
+        is_fresh: bool = True,
     ) -> list[str]:
         if _NEW_SESSION_FLAGS_SUPPORTED is None:
             _set_new_session_flags_supported(
@@ -533,10 +540,16 @@ class SessionRouter:
         if max_turns is not None:
             cmd += ["--max-turns", str(int(max_turns))]
         if run_budget_s is not None:
-            if new_cli:
+            if new_cli and is_fresh:
+                # --run-budget is a creation-only override: the gateway freezes
+                # it in the session's launch route. Sending it on a resume is
+                # refused by check_resume_policy / _classic_only_policy, which is
+                # the root cause of the Oct-31 resume failure (Issue #64).
                 cmd += ["--run-budget", str(int(run_budget_s))]
             # v0.19.x has no --run-budget; run_budget_s is still enforced as
             # the subprocess timeout by the caller.
+            # On resume (is_fresh=False) --run-budget is omitted entirely; the
+            # frozen route is reused as-is.
         return cmd
 
     def _rename_session(self, session_id: str, title: str) -> None:
