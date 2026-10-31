@@ -55,11 +55,17 @@ fi
 cd "$DISPATCHER_HOME"
 
 # The server runtime ships its own venv; other hosts use PATH.
-if [ -x "/usr/local/lib/hermes-agent/venv/bin/python" ]; then
+# Prefer the canonical Hermes interpreter (py3.14); fall back to the legacy
+# 0.19.0 venv, then PATH python.
+_CANDIDATE_PY="/root/.hermes/tools/python-3.14.7+202****0901-linux-x64/bin/python3"
+if [ -x "$_CANDIDATE_PY" ]; then
+  PY="${DISPATCHER_PYTHON:-$_CANDIDATE_PY}"
+elif [ -x "/usr/local/lib/hermes-agent/venv/bin/python" ]; then
   PY="${DISPATCHER_PYTHON:-/usr/local/lib/hermes-agent/venv/bin/python}"
 else
   PY="${DISPATCHER_PYTHON:-python}"
 fi
+unset _CANDIDATE_PY
 
 # Outermost guard: no tick may hang. The in-process budget
 # (DISPATCHER_TICK_BUDGET_S, default 1500s) is the primary bound, but a

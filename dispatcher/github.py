@@ -16,6 +16,7 @@ written to a log line).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,35 @@ OUTCOMES_REL = Path("hermes") / "dispatch_outcomes.jsonl"
 _TERMINAL_STATUSES = frozenset({"DONE", "FAILED", "CANCELLED"})
 
 _SHORT_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+# Secret scrubbing for durable outcome records (Issue #30 governance gap):
+# the same token shapes the verification gate redacts in its bundles must
+# never reach the ledger, the inbox or an outcome commit message.
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)(token|secret|password|api[_-]?key|passwd|credential)\s*[:=]\s*\S+"
+)
+_GITHUB_PAT_RE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,})\b")
+_LONG_TOKEN_RE = re.compile(r"\b([A-Za-z0-9_\-]{36,})\b")
+
+
+def scrub_secrets(text: str) -> str:
+    """Redact token-shaped secrets from a string that will be persisted.
+
+    Never truncates (the caller owns length); it only scrubs. A value that
+    looks like a credential becomes a short prefix plus a hash tail, so the
+    record stays linkable but not replayable.
+    """
+    if not text:
+        return text
+
+    def _tail(m: "re.Match[str]") -> str:
+        tok = m.group(1)
+        return tok[:4] + "…" + hashlib.sha256(tok.encode()).hexdigest()[:8]
+
+    out = _SECRET_ASSIGN_RE.sub(r"\1=***REDACTED***", text)
+    out = _GITHUB_PAT_RE.sub(_tail, out)
+    out = _LONG_TOKEN_RE.sub(_tail, out)
+    return out
 
 
 class ControlRepoError(RuntimeError):
@@ -101,6 +131,21 @@ class OutcomeRecord:
     # owner control). Omitted from the line when empty, so legacy rows and
     # owner hand-edited tasks stay byte-stable.
     source: str = ""
+    # Attempt count of the run that produced this terminal outcome (1-based;
+    # the claim that started the run). 0 = not recorded (legacy rows).
+    # Omitted from the line when 0.
+    attempt: int = 0
+    # Concise redacted reason for a non-DONE terminal outcome (e.g.
+    # "agent exited 124"). Already scrubbed by scrub_secrets() at the
+    # write boundary. Omitted from the line when empty.
+    reason: str = ""
+    # Recovery markers (Issue #30 ledger-gap repair): True when this line was
+    # reconstructed from durable evidence (dispatcher state DB, outcome
+    # commits, verification bundles) after a terminal outcome was lost to a
+    # pre-run_id dedup bug. recovered_from carries the provenance. Legacy and
+    # live lines omit both keys.
+    recovered: bool = False
+    recovered_from: str = ""
 
 
 class ControlRepo:
@@ -177,6 +222,8 @@ class ControlRepo:
         owner_action: str | None = None,
         run_id: str = "",
         source: str = "",
+        attempt: int = 0,
+        reason: str = "",
     ) -> str | None:
         """Record a finished task.
 
@@ -192,16 +239,24 @@ class ControlRepo:
         run exactly once (Issue #43). Non-terminal statuses (``RUNNING`` etc.)
         are always recorded, since a task can pass through them more than once
         across retries.
+
+        ``summary`` and ``reason`` are scrubbed for token-shaped secrets
+        before anything durable is written (Issue #30 governance gap: no
+        secret may reach the ledger, the inbox or the outcome commit
+        message).
         """
         if not task_id:
             raise ControlRepoError("task_id is required")
         if not status:
             raise ControlRepoError("status is required")
 
+        summary = scrub_secrets(summary or "")
+        reason = scrub_secrets(reason or "")
+
         record = OutcomeRecord(
             task_id=task_id,
             status=status,
-            summary=summary or "",
+            summary=summary,
             evidence=list(evidence or []),
             ts=_now_iso(),
             commit_sha=commit_sha,
@@ -209,6 +264,8 @@ class ControlRepo:
             owner_action=owner_action,
             run_id=run_id or "",
             source=source or "",
+            attempt=int(attempt or 0),
+            reason=reason,
         )
 
         changed = self._append_outcome(record)
@@ -440,8 +497,19 @@ class ControlRepo:
                     )
                     return False
         line = json.dumps(_record_to_obj(record), ensure_ascii=False, sort_keys=False)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        # Atomic publish (Issue #30 governance gap): the ledger is rewritten
+        # through a sibling temp file + os.replace. A process killed mid-write
+        # leaves the previous ledger intact, and the next tick re-attempts the
+        # same run — deduplicated by (task_id, status, run_id) — instead of a
+        # torn trailing line wedging every later tick's ledger read.
+        content = ""
+        if path.is_file():
+            content = read_text_exact(path)
+            if content and not content.endswith("\n"):
+                content += "\n"
+        tmp = path.with_name(path.name + ".tmp")
+        write_text_exact(tmp, content + line + "\n")
+        os.replace(tmp, path)
         return True
 
 
@@ -536,6 +604,14 @@ def _record_to_obj(record: OutcomeRecord) -> dict[str, Any]:
         obj["run_id"] = record.run_id
     if record.source:
         obj["source"] = record.source
+    if record.attempt:
+        obj["attempt"] = record.attempt
+    if record.reason:
+        obj["reason"] = record.reason
+    if record.recovered:
+        obj["recovered"] = True
+    if record.recovered_from:
+        obj["recovered_from"] = record.recovered_from
     return obj
 
 
@@ -551,7 +627,11 @@ def _record_from_obj(obj: dict[str, Any]) -> OutcomeRecord:
         owner_action=obj.get("owner_action"),
         run_id=obj.get("run_id", "") or "",
         source=obj.get("source", "") or "",
-    )
+        attempt=int(obj.get("attempt", 0) or 0),
+        reason=obj.get("reason", "") or "",
+        recovered=bool(obj.get("recovered", False)),
+        recovered_from=obj.get("recovered_from", "") or "",
+        )
 
 
 def looks_like_sha(value: str | None) -> bool:

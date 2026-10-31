@@ -752,6 +752,12 @@ class Dispatcher:
                     # (github-issue-<n> / spawned-by:<task> / "") so every
                     # automated run is traceable to its origin.
                     source=task.source,
+                    # Attempt count + concise redacted reason (Issue #30
+                    # governance gap): the ledger row is self-explanatory
+                    # without joining the state DB; write_outcome scrubs
+                    # both for token-shaped secrets before persistence.
+                    attempt=state.attempts,
+                    reason=state.last_error or "",
                 )
                 if got:
                     sha = got
