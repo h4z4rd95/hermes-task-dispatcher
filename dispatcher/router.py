@@ -539,17 +539,17 @@ class SessionRouter:
             cmd += ["--model", model]
         if max_turns is not None:
             cmd += ["--max-turns", str(int(max_turns))]
-        if run_budget_s is not None:
-            if new_cli and is_fresh:
-                # --run-budget is a creation-only override: the gateway freezes
-                # it in the session's launch route. Sending it on a resume is
-                # refused by check_resume_policy / _classic_only_policy, which is
-                # the root cause of the Oct-31 resume failure (Issue #64).
-                cmd += ["--run-budget", str(int(run_budget_s))]
-            # v0.19.x has no --run-budget; run_budget_s is still enforced as
-            # the subprocess timeout by the caller.
-            # On resume (is_fresh=False) --run-budget is omitted entirely; the
-            # frozen route is reused as-is.
+        # NB: --run-budget is deliberately NEVER sent (v0.22.x, 2026-11-03 fix).
+        # The CLI's own _resolve_continue_arg turns `-c <name> --create-if-missing`
+        # into a session.create (frozen launch_request WITHOUT the creation flags)
+        # followed by a RESUME of that brand-new session, so check_resume_policy
+        # refuses any --run-budget mismatch — even on a fresh name (verified by
+        # repro on gglvp-migration-01). run_budget_s is still enforced by the
+        # caller as the subprocess timeout. The Oct-31 "creation-only" condition
+        # (new_cli and is_fresh) did not help because is_fresh is computed from
+        # the session-title probe, which is a false negative whenever the store
+        # title differs from the session name — and even when it is correct, the
+        # CLI's internal create-then-resume path still trips the policy check.
         return cmd
 
     def _rename_session(self, session_id: str, title: str) -> None:
