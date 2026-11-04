@@ -69,6 +69,15 @@ model            = ""                    # optional model override
 Task states: `READY`, `RUNNING`, `BLOCKED`, `DONE`, `FAILED`, `CANCELLED`.
 Terminal: `DONE`, `FAILED`, `CANCELLED`.
 
+### Owner status promotion synchronization
+
+The control-repo inbox is the owner authorization source. On each tick, an
+explicit inbox transition from `PENDING` or `BLOCKED` to `READY` is mirrored
+into the SQLite task state so the task can be claimed. This synchronization
+clears stale lease/skip metadata. It never re-arms terminal SQLite states
+(`DONE`, `FAILED`, `CANCELLED`); terminal re-arm requires the documented
+owner-controlled recovery path.
+
 ## Lane ownership
 
 | Lane | Owns (only these files) |

@@ -131,6 +131,14 @@ on an ephemeral port (`test_http_get_probe_with_local_server_fixture`), plus
 `file_exists` and closed-port `tcp_connect` fixtures. No production service
 is touched by any probe test.
 
+## Empty workspace is not proof of completion
+
+A repo-backed task that exits zero but leaves no inspectable change/artifact is
+`PARTIAL`, not `PASS`. It therefore cannot become `DONE`. The explicit
+not-applicable exception applies only when a non-empty diff contains no
+testable code paths (for example, a documentation-only change); an empty diff
+must not be treated as a successful no-op or echo-task completion.
+
 ## Evidence reuse — the duplicate-work kill-switch
 
 Evidence is keyed by `(task_id, check_id, commit_sha, env_digest,

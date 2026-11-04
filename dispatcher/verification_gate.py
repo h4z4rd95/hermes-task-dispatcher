@@ -678,19 +678,15 @@ class VerificationGate:
                 return na
         changed = git.changed_since(self.baseline_sha or "HEAD~1")
         if not changed:
-            # Empty diff: nothing was changed in the workspace, so there is
-            # genuinely nothing to verify for this tier. This is a
-            # not-applicable result that collapses to PASS (governance: a
-            # required set that collapsed entirely to not-applicable is a
-            # PASS), e.g. repo-backed echo tasks. A non-empty diff with no
-            # mappable tests stays PARTIAL (fail-closed) per the governance
-            # tests.
+            # An empty diff is not equivalent to a docs-only diff. It means
+            # the task produced no inspectable artifact, so a successful agent
+            # exit must not be promoted to DONE on that basis alone.
             return CheckResult(
                 check_id="targeted_tests",
                 status="PARTIAL",
                 command="(none selected)",
-                output="no changes to verify",
-                skip_reason="not applicable: no changes in the workspace",
+                output="no changes or artifacts to verify",
+                skip_reason="no changes in task workspace; completion is unproven",
                 started_at=started,
             )
         # Only Python files can be pytest targets: a markdown or json file

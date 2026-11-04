@@ -235,10 +235,9 @@ def test_t1_missing_test_runner_is_blocked_not_failed(tmp_path, monkeypatch):
 
 
 
-def test_t1_empty_diff_is_not_applicable_and_passes(tmp_path):
-    # Regression (2026-10-18): a workspace with no changes at all (e.g. a
-    # repo-backed echo task; shallow clones where the worker never commits)
-    # must be not-applicable at T1, collapsing to PASS — not PARTIAL/FAILED.
+def test_t1_empty_diff_is_unproven_and_fails_closed(tmp_path):
+    # A repo-backed task that exits zero but produces no inspectable artifact
+    # must not be promoted to DONE merely because its diff is empty.
     repo = make_repo(tmp_path)
     write(repo, "dispatcher/mod.py", "def f():\n    return 1\n")
     write(repo, "tests/test_mod.py", "def test_f():\n    assert True\n")
@@ -247,11 +246,12 @@ def test_t1_empty_diff_is_not_applicable_and_passes(tmp_path):
     gate = gate_for(tmp_path, risk_tier="T1", baseline_sha=head)
     bundle = gate.run()
 
-    assert bundle.status == "PASS"
+    assert bundle.status == "PARTIAL"
     assert bundle.changed_files == []
     tt = next(c for c in bundle.checks if c["check_id"] == "targeted_tests")
     assert tt["status"] == "PARTIAL"
-    assert tt["skip_reason"].startswith("not applicable")
+    assert "completion is unproven" in tt["skip_reason"]
+    assert not tt["skip_reason"].startswith("not applicable")
 
 
 def test_targeted_tests_never_selects_non_python_files(tmp_path):

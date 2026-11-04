@@ -218,6 +218,33 @@ def test_pending_task_is_valid_but_not_claimed(env):
     assert store.get("T-PENDING").status == "PENDING"
 
 
+def test_owner_promotion_from_pending_to_ready_syncs_sqlite_and_claims(env):
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-PROMOTE", title="Owner promoted",
+                                prompt_inline="Reply PONG", status="PENDING")])
+    first = d.tick()
+    assert first.claimed == []
+    assert store.get("T-PROMOTE").status == "PENDING"
+
+    _write_inbox(control, [Task(id="T-PROMOTE", title="Owner promoted",
+                                prompt_inline="Reply PONG", status="READY")])
+    second = d.tick()
+    assert second.claimed == ["T-PROMOTE"]
+    assert "T-PROMOTE" in second.completed
+    assert store.get("T-PROMOTE").status == "DONE"
+
+
+def test_ready_inbox_does_not_auto_rearm_terminal_sqlite_state(env):
+    d, cfg, store, router, workspace, control_repo, control = env
+    store.upsert(TaskState(task_id="T-FAILED", status="FAILED"))
+    _write_inbox(control, [Task(id="T-FAILED", title="Must not auto-rearm",
+                                prompt_inline="Reply PONG", status="READY")])
+    report = d.tick()
+    assert report.claimed == []
+    assert store.get("T-FAILED").status == "FAILED"
+    assert router.calls == []
+
+
 def test_ready_task_is_claimed_and_completes(env):
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-1", title="Smoke", prompt_inline="Reply PONG",

@@ -194,7 +194,7 @@ def test_no_workdir_means_no_in_flag():
 
 
 def test_optional_flags_only_when_supplied():
-    """On a fresh session, --run-budget is forwarded as a creation-only override."""
+    """Model and turn flags are forwarded; gateway launch budget is never overridden."""
     runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=False)
     router = make_router(runner)
     router.run(
@@ -207,7 +207,7 @@ def test_optional_flags_only_when_supplied():
     cmd = _chat_cmd(runner)
     assert cmd[cmd.index("--model") + 1] == "anthropic/claude-sonnet-4"
     assert cmd[cmd.index("--max-turns") + 1] == "12"
-    assert cmd[cmd.index("--run-budget") + 1] == "900"
+    assert "--run-budget" not in cmd
 
 
 def test_run_budget_omitted_on_resume():
@@ -223,14 +223,14 @@ def test_run_budget_omitted_on_resume():
     assert "--run-budget" not in cmd
 
 
-def test_run_budget_omitted_on_resume_but_present_on_fresh():
-    """Same --run-budget value: included for fresh, omitted for resume."""
-    for exists, has_budget in [(False, True), (True, False)]:
+def test_run_budget_never_overrides_gateway_launch_policy():
+    """The router never sends --run-budget, on either fresh or resumed sessions."""
+    for exists in (False, True):
         runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=exists)
         router = make_router(runner)
         router.run(session_name="smoke-1", prompt="hi", run_budget_s=900)
         cmd = _chat_cmd(runner)
-        assert ("--run-budget" in cmd) is has_budget
+        assert "--run-budget" not in cmd
 
 
 def test_no_optional_flags_by_default():

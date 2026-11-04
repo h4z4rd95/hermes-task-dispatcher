@@ -419,7 +419,22 @@ class Dispatcher:
         from .registry import STATES
 
         for task in inbox.tasks:
-            if task.id in states:
+            state = states.get(task.id)
+            if state is not None:
+                # Owner promotion is the one safe non-terminal transition that
+                # must cross the TOML/SQLite boundary. Without this, a task
+                # registered PENDING and later promoted to READY remains stuck
+                # forever in SQLite even though the canonical inbox says READY.
+                # Never auto-rearm terminal states (FAILED/DONE/CANCELLED).
+                if task.status == "READY" and state.status in {"PENDING", "BLOCKED"}:
+                    state.status = "READY"
+                    state.lease_pid = None
+                    state.lease_start = None
+                    state.lease_expiry = None
+                    state.last_error = ""
+                    state.last_skip_reason = ""
+                    self.store.upsert(state)
+                    states[task.id] = state
                 continue
             from .state import TaskState
 
