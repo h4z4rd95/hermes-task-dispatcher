@@ -476,6 +476,8 @@ def test_failed_run_keeps_workspace_for_same_task_resume(env, monkeypatch):
     assert "DISPATCHER RECOVERY" in d._router.calls[1]["prompt"]
     assert "do not restart" in d._router.calls[1]["prompt"].lower()
     assert "previous named Hermes session was found" in d._router.calls[1]["prompt"]
+    assert "\\n" not in d._router.calls[1]["prompt"]
+    assert "\n" in d._router.calls[1]["prompt"]
     assert store.get("T-RESUME").status == "DONE"
     assert second_report.completed == ["T-RESUME"]
     assert workspace.released == [Path(state.workspace_path)]
