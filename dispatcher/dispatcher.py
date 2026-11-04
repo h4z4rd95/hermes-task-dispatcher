@@ -629,7 +629,9 @@ class Dispatcher:
         ]
         if checkout_path is not None:
             evidence.append({"kind": "workspace", "path": str(checkout_path)})
-        commit_sha = self._maybe_task_commit(task)
+        # Partial work must remain in the task workspace after an
+        # interruption/failure; only a verified DONE run may auto-commit it.
+        commit_sha = self._maybe_task_commit(task) if status == "DONE" else ""
         self.store.release(
             task.id,
             status=status,
@@ -651,11 +653,17 @@ class Dispatcher:
             workspace_path=str(checkout_path) if checkout_path else "",
             source=task.source,
         ).write(self.cfg.outcomes_dir)
-        if checkout_path is not None and not task.keep_workspace:
+        if checkout_path is not None:
             try:
-                self.workspace.release(checkout_path)
+                if status == "DONE" and not task.keep_workspace:
+                    self.workspace.release(checkout_path)
+                else:
+                    # Failed/blocked workspaces are recovery evidence, not
+                    # disposable cache entries. Retain until success or an
+                    # explicit operator reclaim.
+                    self.workspace.keep(checkout_path)
             except Exception as exc:
-                self.log("warn", f"{task.id}: workspace release failed: {exc}")
+                self.log("warn", f"{task.id}: workspace retention update failed: {exc}")
         if status == "DONE":
             report.completed.append(task.id)
         else:
