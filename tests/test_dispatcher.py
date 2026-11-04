@@ -70,6 +70,7 @@ class FakeWorkspace:
     def __init__(self):
         self.checkouts: list[dict[str, Any]] = []
         self.released: list[Path] = []
+        self.kept: list[Path] = []
         self.bound: list[tuple[Path, str]] = []
 
     def checkout(self, *, task_id, repo, branch="main", purpose="", keep=False,
@@ -85,7 +86,7 @@ class FakeWorkspace:
         self.released.append(path)
 
     def keep(self, path: Path) -> None:
-        pass
+        self.kept.append(path)
 
 
 class FakeControl:
@@ -414,6 +415,35 @@ def test_checkout_created_when_repo_set(env):
     assert state.workspace_path
     # default policy is to release the workspace after completion
     assert workspace.released
+
+
+def test_failed_run_keeps_workspace_for_same_task_resume(env):
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-RESUME", title="recover", prompt_inline="p",
+                                repo="h4z4rd95/example")])
+    d._router = FakeRouter(runs=[FakeRun(session_id="session-resume", exit_code=124,
+                                         stdout="partial output")])
+    commit_calls = []
+    d._maybe_task_commit = lambda task: commit_calls.append(task.id) or "unexpected"
+    d.tick()
+
+    state = store.get("T-RESUME")
+    assert state.status == "FAILED"
+    assert state.session_id == "session-resume"
+    assert state.workspace_path
+    assert workspace.kept == [Path(state.workspace_path)]
+    assert workspace.released == []
+    assert commit_calls == []
+
+    # Retry keeps the same task-derived session identity and workspace path.
+    store.reset_to_ready("T-RESUME", note="controlled retry")
+    d._router = FakeRouter(runs=[FakeRun(session_id="session-resume", exit_code=0,
+                                         resumed=True)])
+    d.tick()
+    assert [call["session_name"] for call in d._router.calls] == [
+        "dispatcher-T-RESUME"
+    ]
+    assert workspace.released == [Path(state.workspace_path)]
 
 
 def test_keep_workspace_not_released(env):
