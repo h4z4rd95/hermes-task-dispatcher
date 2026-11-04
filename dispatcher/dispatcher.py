@@ -919,11 +919,11 @@ def _recovery_continuation_prompt(
             "was restored. "
         )
     return (
-        "[DISPATCHER RECOVERY — CONTINUE, DO NOT RESTART]\\n"
-        f"Task ID: {task_id}\\n"
-        f"Existing session name: {session_name}\\n"
-        f"Last known session ID: {session_id or 'not recorded'}\\n"
-        f"Persistent workspace: {workspace_path or 'not recorded'}\\n"
+        "[DISPATCHER RECOVERY — CONTINUE, DO NOT RESTART]\n"
+        f"Task ID: {task_id}\n"
+        f"Existing session name: {session_name}\n"
+        f"Last known session ID: {session_id or 'not recorded'}\n"
+        f"Persistent workspace: {workspace_path or 'not recorded'}\n"
         + session_context
         + "First inspect the current workspace: git status, tracked diff, "
         "untracked files, local HEAD, and origin HEAD. Preserve all existing "
@@ -931,8 +931,8 @@ def _recovery_continuation_prompt(
         "steps. Reconcile remote changes safely, then continue from the last "
         "verified action. If the task was already completed, perform only "
         "missing acceptance checks and publish the outcome. Keep the same task "
-        "identity and workspace.\\n\\n"
-        "[ORIGINAL TASK INSTRUCTIONS]\\n"
+        "identity and workspace.\n\n"
+        "[ORIGINAL TASK INSTRUCTIONS]\n"
         f"{original_prompt}"
     )
 
