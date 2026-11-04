@@ -487,11 +487,20 @@ class Dispatcher:
 
         session_name = task.session or f"dispatcher-{task.id}"
         if state.attempts > 1:
+            try:
+                session_exists = self.router.session_name_exists(session_name)
+            except Exception as exc:
+                session_exists = None
+                self.log(
+                    "warn",
+                    f"{task.id}: could not verify prior session before recovery: {exc}",
+                )
             prompt = _recovery_continuation_prompt(
                 task_id=task.id,
                 session_name=session_name,
                 session_id=state.session_id,
                 workspace_path=state.workspace_path or str(checkout_path or ""),
+                session_exists=session_exists,
                 original_prompt=prompt,
             )
         run_budget_s = task.timeout_seconds or None
@@ -883,24 +892,47 @@ def _recovery_continuation_prompt(
     session_name: str,
     session_id: str,
     workspace_path: str,
+    session_exists: bool | None,
     original_prompt: str,
 ) -> str:
     """Add a resume-first instruction while retaining the original task scope."""
+    if session_exists is True:
+        session_context = (
+            "The previous named Hermes session was found. Resume that existing "
+            "session and continue its history; do not create a duplicate. "
+        )
+    elif session_exists is False:
+        session_context = (
+            "The previous named Hermes session was NOT found. This invocation "
+            "will be a replacement session linked to the SAME Task ID and "
+            "workspace, not the original session. Do not claim the original "
+            "session was restored. Reconstruct from the persistent workspace, "
+            "task ledger, Git history, outcome files, and any available logs or "
+            "transcript; then continue from the last verified action. "
+        )
+    else:
+        session_context = (
+            "Prior session availability is UNKNOWN. Check whether the named "
+            "session exists. Resume it if present; otherwise reconstruct from "
+            "the persistent workspace, task ledger, Git history, outcome files, "
+            "and available logs/transcript. Never claim an unverified session "
+            "was restored. "
+        )
     return (
-        "[DISPATCHER RECOVERY — CONTINUE, DO NOT RESTART]\n"
-        f"Task ID: {task_id}\n"
-        f"Existing session name: {session_name}\n"
-        f"Last known session ID: {session_id or 'not recorded'}\n"
-        f"Persistent workspace: {workspace_path or 'not recorded'}\n"
-        "This is a continuation of the same task after a transient interruption. "
-        "First inspect the prior session history and current workspace: git status, "
-        "tracked diff, untracked files, local HEAD, and origin HEAD. Preserve all "
-        "existing edits and commits. Do not run reset --hard, reclone, or repeat "
-        "completed steps. Determine the last completed action, reconcile any "
-        "remote changes safely, then continue from that exact point. If the task "
-        "was already completed, perform only missing acceptance checks and "
-        "publish the outcome. Keep the same task identity, session, and workspace.\n\n"
-        "[ORIGINAL TASK INSTRUCTIONS]\n"
+        "[DISPATCHER RECOVERY — CONTINUE, DO NOT RESTART]\\n"
+        f"Task ID: {task_id}\\n"
+        f"Existing session name: {session_name}\\n"
+        f"Last known session ID: {session_id or 'not recorded'}\\n"
+        f"Persistent workspace: {workspace_path or 'not recorded'}\\n"
+        + session_context
+        + "First inspect the current workspace: git status, tracked diff, "
+        "untracked files, local HEAD, and origin HEAD. Preserve all existing "
+        "edits and commits. Do not run reset --hard, reclone, or repeat completed "
+        "steps. Reconcile remote changes safely, then continue from the last "
+        "verified action. If the task was already completed, perform only "
+        "missing acceptance checks and publish the outcome. Keep the same task "
+        "identity and workspace.\\n\\n"
+        "[ORIGINAL TASK INSTRUCTIONS]\\n"
         f"{original_prompt}"
     )
 
