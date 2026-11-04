@@ -438,16 +438,35 @@ def test_exists_is_read_only_and_side_effect_free():
     assert "chat" not in " ".join(cmd)
 
 
-def test_exists_fails_closed_on_nonzero_exit():
+def test_exists_fails_closed_on_nonzero_exit(monkeypatch):
     runner = FakeRunner(stdout="", stderr="boom", returncode=1)
     router = make_router(runner)
+    monkeypatch.setattr(SessionRouter, "_session_title_exists_in_db", lambda self, name: None)
     assert router.session_name_exists("smoke-1") is False
+    assert router.probe_session_name("smoke-1") is None
 
 
-def test_exists_fails_closed_on_exception():
+def test_exists_fails_closed_on_exception(monkeypatch):
     runner = FakeRunner(raise_exc=OSError("no such binary"))
     router = make_router(runner)
+    monkeypatch.setattr(SessionRouter, "_session_title_exists_in_db", lambda self, name: None)
     assert router.session_name_exists("smoke-1") is False
+    assert router.probe_session_name("smoke-1") is None
+
+
+def test_probe_session_name_uses_db_truth_after_cli_failure(monkeypatch):
+    runner = FakeRunner(stdout="", stderr="boom", returncode=1)
+    router = make_router(runner)
+    monkeypatch.setattr(SessionRouter, "_session_title_exists_in_db", lambda self, name: True)
+    assert router.probe_session_name("known-in-db") is True
+
+
+def test_probe_session_name_preserves_unknown_when_both_checks_fail(monkeypatch):
+    runner = FakeRunner(stdout="", stderr="boom", returncode=1)
+    router = make_router(runner)
+    monkeypatch.setattr(SessionRouter, "_session_title_exists_in_db", lambda self, name: None)
+    assert router.probe_session_name("unknown") is None
+    assert router.session_name_exists("unknown") is False
 
 
 def test_exists_tolerates_crlf_and_box_whitespace():

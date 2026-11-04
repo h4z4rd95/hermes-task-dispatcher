@@ -488,7 +488,12 @@ class Dispatcher:
         session_name = task.session or f"dispatcher-{task.id}"
         if state.attempts > 1:
             try:
-                session_exists = self.router.session_name_exists(session_name)
+                probe = getattr(self.router, "probe_session_name", None)
+                session_exists = (
+                    probe(session_name)
+                    if callable(probe)
+                    else self.router.session_name_exists(session_name)
+                )
             except Exception as exc:
                 session_exists = None
                 self.log(

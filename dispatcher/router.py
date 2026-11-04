@@ -252,51 +252,16 @@ class SessionRouter:
     # Existence query
     # ------------------------------------------------------------------ #
     def session_name_exists(self, session_name: str) -> bool:
-        """Return ``True`` when a session named *session_name* exists.
+        """Fail-closed boolean wrapper used by the router's run path."""
+        return self.probe_session_name(session_name) is True
 
-        Chosen mechanism (documented per CONTRACT.md, with evidence):
+    def probe_session_name(self, session_name: str) -> bool | None:
+        """Return True/False when known, or None when existence is unknown.
 
-        ``hermes sessions export --format md --dry-run --title "<name>"``.
-
-        Why this over the alternatives:
-
-        * It is **read-only and side-effect free**. ``--dry-run`` short
-          circuits before any file is written, so nothing touches the session
-          store, the filesystem, or the network. Verified on this host: with
-          ``--dry-run`` the command only prints ``Would export N session(s)
-          (title contains '<name>').`` and exits ``0``.
-        * It **filters by title from the SQLite store** rather than by
-          workspace, which matches the dispatcher's model: a task names its
-          session by title (``session = "name"`` in ``tasks_inbox.toml``) and
-          the router targets it by that same title via ``--continue``.
-        * It has a **machine-readable decision boundary**: any ``N >= 1``
-          means the name is taken; ``0`` means it is free. Title matching is a
-          substring ``LIKE`` in the store, so a caller asking about
-          ``foo`` would also match ``foobar``; the router therefore asks about
-          the exact title and treats a count of zero as "does not exist".
-
-        Evidence gathered on this host (Hermes v0.21.5+6718):
-
-        * ``hermes sessions list`` — no JSON output and no title filter (only
-          ``--source``/``--limit``/``--workspace``), so it cannot answer a
-          title question without scraping a human-oriented, Unicode-boxed,
-          CRLF-terminated table whose columns are not title-unique.
-        * ``hermes sessions export --title`` — substring match on the session
-          title. Verified: ``--title "Leantime"`` reports 6 sessions while
-          ``--title "Leantime-RTL"`` reports 1, and a title that matches
-          nothing reports 0.
-        * ``hermes sessions export --format jsonl -`` produced an empty file
-          for a title that exists, so jsonl-to-stdout is not a reliable
-          truth source on this build; the ``--dry-run`` count is.
-
-        Rejected alternative: probing ``hermes chat --continue "<name>" -q ""``.
-        That *writes* to the session store (it creates the session when it is
-        absent, which is exactly the side effect a preflight check must not
-        have) and is documented in CONTRACT.md only as a last resort.
-
-        Nonzero exit or unparseable output resolves to ``False`` (fail closed:
-        the caller re-checks after the run by inspecting the preamble, which is
-        authoritative for the actual routing decision).
+        The CLI dry-run is read-only. If it fails or returns no match, consult
+        the read-only session DB fallback. If both probes fail, return None so
+        recovery callers do not confuse an inspection failure with a missing
+        session. The run path remains fail-closed via session_name_exists().
         """
         cmd = [
             self._bin,
@@ -307,7 +272,7 @@ class SessionRouter:
             "--title", session_name,
         ]
         try:
-            proc = self._runner(  # noqa: S603
+            proc = self._runner(
                 cmd,
                 cwd=self.workdir,
                 env=self._child_env(),
@@ -316,29 +281,25 @@ class SessionRouter:
                 timeout=60,
             )
         except Exception as exc:  # pragma: no cover - defensive
-            self._log(f"session_name_exists({session_name!r}) failed: {exc}")
-            return False
+            self._log(f"session existence CLI probe failed: {exc}")
+            return self._session_title_exists_in_db(session_name)
 
         if proc.returncode != 0:
             self._log(
                 f"session existence probe exit={proc.returncode}: "
                 f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
             )
-            return False
+            return self._session_title_exists_in_db(session_name)
 
         if _count_from_dry_run(proc.stdout) > 0:
             return True
 
-        # Fallback for builds where the CLI title filter is unreliable: on
-        # Hermes v0.19.0 the export dry-run count is always 0 regardless of the
-        # title, so the probe above would answer "does not exist" for a session
-        # that does exist, and every run would spawn a fresh session (breaking
-        # session affinity and duplicating titles). Query the session store
-        # directly, read-only.
+        # CLI count 0 may be genuine absence or a build-specific filter issue;
+        # use the read-only DB lookup as the final authority.
         return self._session_title_exists_in_db(session_name)
 
-    def _session_title_exists_in_db(self, session_name: str) -> bool:
-        """Read-only exact-title lookup against the live Hermes session store."""
+    def _session_title_exists_in_db(self, session_name: str) -> bool | None:
+        """Read-only exact-title lookup; None means the database probe failed."""
         import sqlite3
 
         home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
@@ -354,10 +315,8 @@ class SessionRouter:
             finally:
                 con.close()
         except Exception as exc:
-            # Fail closed: the caller treats False as "create a new session",
-            # which is always the safe direction.
             self._log(f"session db title lookup failed: {exc}")
-            return False
+            return None
 
     # ------------------------------------------------------------------ #
     # Run

@@ -43,11 +43,17 @@ class FakeRouter:
         self.extra_env: dict[str, str] = {}
         self._n = 0
         self.session_exists_override: bool | None = None
+        self.session_probe_unknown = False
 
-    def session_name_exists(self, name: str) -> bool:
+    def probe_session_name(self, name: str) -> bool | None:
+        if self.session_probe_unknown:
+            return None
         if self.session_exists_override is not None:
             return self.session_exists_override
         return any(c["session_name"] == name for c in self.calls)
+
+    def session_name_exists(self, name: str) -> bool:
+        return self.probe_session_name(name) is True
 
     def run(self, *, session_name: str, prompt: str, model: str | None = None,
             max_turns: int | None = None, run_budget_s: int | None = None) -> FakeRun:
@@ -503,6 +509,25 @@ def test_missing_prior_session_reconstructs_without_claiming_restore(env, monkey
     assert "Do not claim the original session was restored" in prompt
     assert store.get("T-SESSION-LOST").session_id == "replacement-session"
     assert store.get("T-SESSION-LOST").status == "DONE"
+
+
+def test_unknown_session_probe_is_not_mislabeled_missing(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-SESSION-UNKNOWN", title="unknown probe",
+                                prompt_inline="p", repo="h4z4rd95/example")])
+    d._router = FakeRouter(runs=[
+        FakeRun(session_id="old-session", exit_code=124, timed_out=True),
+        FakeRun(session_id="replacement-session", exit_code=0, resumed=False),
+    ])
+    d.tick()
+    d._router.session_probe_unknown = True
+    d.tick()
+
+    prompt = d._router.calls[1]["prompt"]
+    assert "Prior session availability is UNKNOWN" in prompt
+    assert "previous named Hermes session was NOT found" not in prompt
+    assert store.get("T-SESSION-UNKNOWN").status == "DONE"
 
 
 def test_connection_interrupted_text_is_recoverable_but_auth_is_not():
