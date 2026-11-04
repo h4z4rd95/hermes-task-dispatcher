@@ -486,6 +486,14 @@ class Dispatcher:
             return
 
         session_name = task.session or f"dispatcher-{task.id}"
+        if state.attempts > 1:
+            prompt = _recovery_continuation_prompt(
+                task_id=task.id,
+                session_name=session_name,
+                session_id=state.session_id,
+                workspace_path=state.workspace_path or str(checkout_path or ""),
+                original_prompt=prompt,
+            )
         run_budget_s = task.timeout_seconds or None
         if run_budget_s is not None:
             # Never let a single task's configured budget consume the whole
@@ -537,11 +545,62 @@ class Dispatcher:
         )
         state.session_id = run.session_id
         self.store.upsert(state)
-        if checkout_path is not None:
+        if checkout_path is not None and run.session_id:
             try:
                 self.workspace.bind_session(checkout_path, run.session_id)
             except Exception as exc:
                 self.log("warn", f"{task.id}: workspace bind failed: {exc}")
+
+        # A transport interruption is not a task-level failure. Keep the
+        # existing task/session/workspace and let the next scheduled tick
+        # continue it. Do not run the completion gate or commit partial work.
+        if _is_recoverable_transport_failure(run):
+            retry_available = state.attempts < task.max_retries
+            recovery_status = "READY" if retry_available else "FAILED"
+            interruption_summary = _truncate(run.stdout.strip(), 800)
+            reason = (
+                "recoverable transport interruption; retry scheduled"
+                if retry_available
+                else "transport interruption; retry budget exhausted"
+            )
+            recovery_evidence = [
+                {"kind": "session", "session_id": run.session_id or state.session_id,
+                 "resumed": run.resumed},
+                {"kind": "run", "exit_code": run.exit_code,
+                 "duration_s": round(run.duration_s, 1),
+                 "timed_out": bool(getattr(run, "timed_out", False))},
+            ]
+            if checkout_path is not None:
+                recovery_evidence.append({"kind": "workspace", "path": str(checkout_path)})
+            self.store.release(
+                task.id,
+                status=recovery_status,
+                summary=interruption_summary or reason,
+                outcome={"evidence": recovery_evidence},
+                session_id=run.session_id or state.session_id,
+                workspace_path=str(checkout_path) if checkout_path else state.workspace_path,
+                error=reason,
+            )
+            if checkout_path is not None:
+                try:
+                    self.workspace.keep(checkout_path)
+                except Exception as exc:
+                    self.log("warn", f"{task.id}: interrupted workspace retention failed: {exc}")
+            if retry_available:
+                report.recovered.append((task.id, "same task/session/workspace queued after transport interruption"))
+            else:
+                OutcomeRecord(
+                    task_id=task.id,
+                    status="FAILED",
+                    summary=interruption_summary or reason,
+                    evidence=recovery_evidence,
+                    session_id=run.session_id or state.session_id,
+                    workspace_path=str(checkout_path) if checkout_path else state.workspace_path,
+                    source=task.source,
+                    error=reason,
+                ).write(self.cfg.outcomes_dir)
+                report.errors.append(f"{task.id}: {reason}")
+            return
 
         # --- Automated verification gate (governance:
         # VERIFICATION_GATE.md / prompts/IMPLEMENT_AUTOMATED_VERIFICATION_GATE) ---
@@ -629,7 +688,9 @@ class Dispatcher:
         ]
         if checkout_path is not None:
             evidence.append({"kind": "workspace", "path": str(checkout_path)})
-        commit_sha = self._maybe_task_commit(task)
+        # Partial work must remain in the task workspace after an
+        # interruption/failure; only a verified DONE run may auto-commit it.
+        commit_sha = self._maybe_task_commit(task) if status == "DONE" else ""
         self.store.release(
             task.id,
             status=status,
@@ -651,11 +712,17 @@ class Dispatcher:
             workspace_path=str(checkout_path) if checkout_path else "",
             source=task.source,
         ).write(self.cfg.outcomes_dir)
-        if checkout_path is not None and not task.keep_workspace:
+        if checkout_path is not None:
             try:
-                self.workspace.release(checkout_path)
+                if status == "DONE" and not task.keep_workspace:
+                    self.workspace.release(checkout_path)
+                else:
+                    # Failed/blocked workspaces are recovery evidence, not
+                    # disposable cache entries. Retain until success or an
+                    # explicit operator reclaim.
+                    self.workspace.keep(checkout_path)
             except Exception as exc:
-                self.log("warn", f"{task.id}: workspace release failed: {exc}")
+                self.log("warn", f"{task.id}: workspace retention update failed: {exc}")
         if status == "DONE":
             report.completed.append(task.id)
         else:
@@ -783,6 +850,59 @@ class Dispatcher:
 
 
 # --- helpers ----------------------------------------------------------------
+
+
+def _is_recoverable_transport_failure(run: Any) -> bool:
+    """Recognize bounded transient transport failures, never auth/quota gates."""
+    if getattr(run, "timed_out", False) or getattr(run, "exit_code", 0) == 124:
+        return True
+    if getattr(run, "exit_code", 0) == 0:
+        return False
+    output = str(getattr(run, "stdout", "") or "").lower()
+    permanent = (
+        "invalid api key", "unauthorized", "http 401", "http 403",
+        "forbidden", "quota exceeded", "insufficient quota",
+        "billing", "payment required",
+    )
+    if any(marker in output for marker in permanent):
+        return False
+    transient = (
+        "connection interrupted", "connection reset", "connection closed",
+        "server disconnected", "unexpected eof", "broken pipe",
+        "timed out", "timeout", "gateway timeout", "temporarily unavailable",
+        "http 429", "http 500", "http 502", "http 503", "http 504",
+        "status code 429", "status code 500", "status code 502",
+        "status code 503", "status code 504", "too many requests", "rate limit",
+    )
+    return any(marker in output for marker in transient)
+
+
+def _recovery_continuation_prompt(
+    *,
+    task_id: str,
+    session_name: str,
+    session_id: str,
+    workspace_path: str,
+    original_prompt: str,
+) -> str:
+    """Add a resume-first instruction while retaining the original task scope."""
+    return (
+        "[DISPATCHER RECOVERY — CONTINUE, DO NOT RESTART]\n"
+        f"Task ID: {task_id}\n"
+        f"Existing session name: {session_name}\n"
+        f"Last known session ID: {session_id or 'not recorded'}\n"
+        f"Persistent workspace: {workspace_path or 'not recorded'}\n"
+        "This is a continuation of the same task after a transient interruption. "
+        "First inspect the prior session history and current workspace: git status, "
+        "tracked diff, untracked files, local HEAD, and origin HEAD. Preserve all "
+        "existing edits and commits. Do not run reset --hard, reclone, or repeat "
+        "completed steps. Determine the last completed action, reconcile any "
+        "remote changes safely, then continue from that exact point. If the task "
+        "was already completed, perform only missing acceptance checks and "
+        "publish the outcome. Keep the same task identity, session, and workspace.\n\n"
+        "[ORIGINAL TASK INSTRUCTIONS]\n"
+        f"{original_prompt}"
+    )
 
 
 def _merge_reports(target: TickReport, other: TickReport) -> None:

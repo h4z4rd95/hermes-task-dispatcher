@@ -29,6 +29,7 @@ class FakeRun:
     stdout: str = "task output"
     duration_s: float = 0.1
     resumed: bool = False
+    timed_out: bool = False
 
 
 class FakeRouter:
@@ -70,6 +71,7 @@ class FakeWorkspace:
     def __init__(self):
         self.checkouts: list[dict[str, Any]] = []
         self.released: list[Path] = []
+        self.kept: list[Path] = []
         self.bound: list[tuple[Path, str]] = []
 
     def checkout(self, *, task_id, repo, branch="main", purpose="", keep=False,
@@ -85,7 +87,30 @@ class FakeWorkspace:
         self.released.append(path)
 
     def keep(self, path: Path) -> None:
+        self.kept.append(path)
+
+
+class PassedGateBundle:
+    status = "PASS"
+    checks = []
+    evidence_reused = 0
+    blockers = []
+
+    def write(self, path):
+        return None
+
+
+class PassedGate:
+    def __init__(self, **kwargs):
         pass
+
+    def run(self, **kwargs):
+        return PassedGateBundle()
+
+
+def _stub_pass_gate(monkeypatch):
+    monkeypatch.setattr("dispatcher.dispatcher.build_probe", lambda **kwargs: None)
+    monkeypatch.setattr("dispatcher.dispatcher.VerificationGate", PassedGate)
 
 
 class FakeControl:
@@ -404,7 +429,8 @@ def test_workstream_isolation(env):
     assert sorted(report.claimed) == ["T-1", "T-2"]
 
 
-def test_checkout_created_when_repo_set(env):
+def test_checkout_created_when_repo_set(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-1", title="x", prompt_inline="p",
                                 repo="h4z4rd95/example")])
@@ -414,6 +440,56 @@ def test_checkout_created_when_repo_set(env):
     assert state.workspace_path
     # default policy is to release the workspace after completion
     assert workspace.released
+
+
+def test_failed_run_keeps_workspace_for_same_task_resume(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-RESUME", title="recover", prompt_inline="p",
+                                repo="h4z4rd95/example")])
+    d._router = FakeRouter(runs=[
+        FakeRun(session_id="session-resume", exit_code=124,
+                stdout="partial output", timed_out=True),
+        FakeRun(session_id="session-resume", exit_code=0,
+                resumed=True, stdout="completed"),
+    ])
+    commit_calls = []
+    d._maybe_task_commit = lambda task: commit_calls.append(task.id) or "verified-commit"
+
+    first_report = d.tick()
+    state = store.get("T-RESUME")
+    assert state.status == "READY"
+    assert state.session_id == "session-resume"
+    assert state.workspace_path
+    assert workspace.kept == [Path(state.workspace_path)]
+    assert workspace.released == []
+    assert commit_calls == []
+    assert first_report.recovered
+
+    second_report = d.tick()
+    assert len(d._router.calls) == 2
+    assert d._router.calls[0]["session_name"] == "dispatcher-T-RESUME"
+    assert d._router.calls[1]["session_name"] == "dispatcher-T-RESUME"
+    assert "DISPATCHER RECOVERY" in d._router.calls[1]["prompt"]
+    assert "do not restart" in d._router.calls[1]["prompt"].lower()
+    assert store.get("T-RESUME").status == "DONE"
+    assert second_report.completed == ["T-RESUME"]
+    assert workspace.released == [Path(state.workspace_path)]
+    assert commit_calls == ["T-RESUME"]
+
+
+def test_connection_interrupted_text_is_recoverable_but_auth_is_not():
+    from dispatcher.dispatcher import _is_recoverable_transport_failure
+
+    assert _is_recoverable_transport_failure(
+        FakeRun(exit_code=1, stdout="Connection interrupted by provider")
+    )
+    assert not _is_recoverable_transport_failure(
+        FakeRun(exit_code=1, stdout="HTTP 401 Invalid API key")
+    )
+    assert not _is_recoverable_transport_failure(
+        FakeRun(exit_code=1, stdout="Quota exceeded")
+    )
 
 
 def test_keep_workspace_not_released(env):

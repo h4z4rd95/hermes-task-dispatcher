@@ -38,17 +38,21 @@ def _fail_if_called(*args, **kwargs):
 class CompletedStub:
     """Minimal stand-in for subprocess.CompletedProcess."""
 
-    stdout = ""
-    stderr = ""
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+        self.stderr = ""
 
 
 class FakeGit:
     """Records git invocations and materialises a fake checkout on clone/sync."""
 
-    def __init__(self, fail_on=()):
+    def __init__(self, fail_on=(), *, dirty=False, ahead=0, behind=1):
         self.calls: list[tuple[tuple[str, ...], str]] = []
         self.fail_on = tuple(fail_on or ())
         self.clone_count = 0
+        self.dirty = dirty
+        self.ahead = ahead
+        self.behind = behind
 
     def install(self, manager: WorkspaceManager) -> WorkspaceManager:
         self_manager = self
@@ -74,6 +78,10 @@ class FakeGit:
                 (Path(cwd) / "README.md").write_text(
                     f"# {REPO}@{BRANCH} (reset)\n"
                 )
+            elif args[0] == "status":
+                return CompletedStub(" M partial.py\n" if self_manager.dirty else "")
+            elif args[0] == "rev-list":
+                return CompletedStub(f"{self_manager.ahead}\t{self_manager.behind}\n")
             return CompletedStub()
 
         manager._git = _git  # type: ignore[method-assign]
@@ -156,13 +164,17 @@ class TestReuse:
         first = manager.checkout(task_id="T-001", repo=REPO, branch=BRANCH)
         marker = first.path / "work.txt"
         marker.write_text("local edits")
+        manager._fake_git.dirty = True  # type: ignore[attr-defined]
 
         second = manager.checkout(task_id="T-001", repo=REPO, branch=BRANCH)
 
         assert second.created is False
         assert second.path == first.path
         assert manager._fake_git.clone_count == 1  # type: ignore[attr-defined]
-        assert marker.exists()  # local file preserved (only reset --hard runs)
+        assert marker.read_text() == "local edits"
+        calls = [a[0] for a, _ in manager._fake_git.calls]  # type: ignore[attr-defined]
+        assert "fetch" in calls
+        assert "reset" not in calls
 
     def test_fetch_and_reset_run_on_reuse(self, manager: WorkspaceManager):
         first = manager.checkout(task_id="T-001", repo=REPO, branch=BRANCH)
@@ -177,6 +189,30 @@ class TestReuse:
         assert any("checkout " + BRANCH in a for a in args)
         assert any(f"reset --hard origin/{BRANCH}" in a for a in args)
         assert (first.path / "fetched.txt").exists()
+
+    def test_local_commits_ahead_of_origin_are_preserved(self, manager: WorkspaceManager):
+        first = manager.checkout(task_id="T-LOCAL", repo=REPO, branch=BRANCH)
+        manager._fake_git.ahead = 2  # type: ignore[attr-defined]
+        manager._fake_git.behind = 0  # type: ignore[attr-defined]
+
+        second = manager.checkout(task_id="T-LOCAL", repo=REPO, branch=BRANCH)
+
+        assert second.path == first.path
+        calls = [a[0] for a, _ in manager._fake_git.calls]  # type: ignore[attr-defined]
+        assert "fetch" in calls
+        assert "reset" not in calls
+        assert "checkout" not in calls
+
+    def test_diverged_workspace_is_preserved(self, manager: WorkspaceManager):
+        first = manager.checkout(task_id="T-DIVERGED", repo=REPO, branch=BRANCH)
+        manager._fake_git.ahead = 1  # type: ignore[attr-defined]
+        manager._fake_git.behind = 3  # type: ignore[attr-defined]
+
+        second = manager.checkout(task_id="T-DIVERGED", repo=REPO, branch=BRANCH)
+
+        assert second.path == first.path
+        calls = [a[0] for a, _ in manager._fake_git.calls]  # type: ignore[attr-defined]
+        assert "reset" not in calls
 
     def test_different_task_gets_own_checkout(self, manager: WorkspaceManager):
         a = manager.checkout(task_id="T-001", repo=REPO, branch=BRANCH)
