@@ -42,8 +42,11 @@ class FakeRouter:
         # variables (DISPATCHER_TASK_DEPTH / DISPATCHER_TASK_ID) into it.
         self.extra_env: dict[str, str] = {}
         self._n = 0
+        self.session_exists_override: bool | None = None
 
     def session_name_exists(self, name: str) -> bool:
+        if self.session_exists_override is not None:
+            return self.session_exists_override
         return any(c["session_name"] == name for c in self.calls)
 
     def run(self, *, session_name: str, prompt: str, model: str | None = None,
@@ -472,10 +475,34 @@ def test_failed_run_keeps_workspace_for_same_task_resume(env, monkeypatch):
     assert d._router.calls[1]["session_name"] == "dispatcher-T-RESUME"
     assert "DISPATCHER RECOVERY" in d._router.calls[1]["prompt"]
     assert "do not restart" in d._router.calls[1]["prompt"].lower()
+    assert "previous named Hermes session was found" in d._router.calls[1]["prompt"]
+    assert "\\n" not in d._router.calls[1]["prompt"]
+    assert "\n" in d._router.calls[1]["prompt"]
     assert store.get("T-RESUME").status == "DONE"
     assert second_report.completed == ["T-RESUME"]
     assert workspace.released == [Path(state.workspace_path)]
     assert commit_calls == ["T-RESUME"]
+
+
+def test_missing_prior_session_reconstructs_without_claiming_restore(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
+    d, cfg, store, router, workspace, control_repo, control = env
+    _write_inbox(control, [Task(id="T-SESSION-LOST", title="rebuild context",
+                                prompt_inline="p", repo="h4z4rd95/example")])
+    d._router = FakeRouter(runs=[
+        FakeRun(session_id="old-session", exit_code=124, timed_out=True),
+        FakeRun(session_id="replacement-session", exit_code=0, resumed=False),
+    ])
+    d.tick()
+    d._router.session_exists_override = False
+    d.tick()
+
+    prompt = d._router.calls[1]["prompt"]
+    assert "previous named Hermes session was NOT found" in prompt
+    assert "replacement session" in prompt
+    assert "Do not claim the original session was restored" in prompt
+    assert store.get("T-SESSION-LOST").session_id == "replacement-session"
+    assert store.get("T-SESSION-LOST").status == "DONE"
 
 
 def test_connection_interrupted_text_is_recoverable_but_auth_is_not():
