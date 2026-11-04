@@ -463,7 +463,15 @@ def test_failed_run_keeps_workspace_for_same_task_resume(env, monkeypatch):
     # Retry keeps the same task-derived session identity and workspace path.
     _write_inbox(control, [Task(id="T-RESUME", title="recover", prompt_inline="p",
                                 repo="h4z4rd95/example", status="READY")])
-    store.reset_to_ready("T-RESUME", note="controlled retry")
+    retry_state = store.get("T-RESUME")
+    retry_state.status = "READY"
+    retry_state.lease_pid = None
+    retry_state.lease_start = None
+    retry_state.lease_expiry = None
+    retry_state.last_error = "controlled retry"
+    store.upsert(retry_state)
+    assert store.get("T-RESUME").status == "READY"
+    assert load_inbox(cfg.inbox_path).tasks[0].status == "READY"
     d._router = FakeRouter(runs=[FakeRun(session_id="session-resume", exit_code=0,
                                          resumed=True)])
     d.tick()
