@@ -238,3 +238,25 @@ def test_outcome_write_is_atomic(tmp_path):
     # no leftover tmp files
     assert not list(d.glob("*.tmp"))
     assert path.name == "T-1.json"
+
+
+def test_process_start_time_uses_linux_stat_start_ticks():
+    # /proc/<pid> directory mtime is mutable; the process identity must come
+    # from field 22 (starttime) of /proc/<pid>/stat.
+    from pathlib import Path
+
+    stat_path = Path(f"/proc/{os.getpid()}/stat")
+    if not stat_path.exists():
+        pytest.skip("Linux /proc is required for this regression test")
+    raw = stat_path.read_text(encoding="ascii")
+    close = raw.rfind(")")
+    fields = raw[close + 2 :].split()
+    expected = float(int(fields[19]))
+    assert process_start_time(os.getpid()) == expected
+    assert pid_alive(os.getpid(), expected) is True
+
+
+def test_pid_alive_rejects_mismatched_start_fingerprint():
+    pid, started = lease_fingerprint()
+    assert pid_alive(pid, started) is True
+    assert pid_alive(pid, started + 100.0) is False

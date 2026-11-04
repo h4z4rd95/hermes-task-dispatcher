@@ -40,9 +40,10 @@ def _now() -> float:
 def process_start_time(pid: int) -> float | None:
     """Best-effort start time of a live process, else None.
 
-    Windows: use the process creation time via ctypes when available; POSIX:
-    read /proc/<pid> mtime. A None result means we cannot prove liveness, so
-    the caller treats the lease as stale (fail-closed recovery).
+    Windows: use the process creation time via ctypes when available; Linux:
+    read field 22 (starttime ticks) from /proc/<pid>/stat. The proc directory's
+    mtime is mutable and must not be used as a process identity fingerprint.
+    On POSIX systems without /proc, return None (fail-closed recovery).
     """
     if pid <= 0:
         return None
@@ -76,11 +77,18 @@ def process_start_time(pid: int) -> float | None:
         except Exception:
             return None
     try:
-        import os as _os
-
-        st = _os.stat(f"/proc/{pid}")
-        return st.st_mtime
-    except Exception:
+        # /proc/<pid> directory mtime can change while the process is alive
+        # (for example when proc entries are added/removed). Use stat field 22,
+        # the kernel starttime counter in clock ticks since boot, instead.
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        close = raw.rfind(")")  # comm (field 2) may itself contain spaces
+        if close < 0:
+            return None
+        fields = raw[close + 2 :].split()  # begins with field 3 (state)
+        if len(fields) <= 19:
+            return None
+        return float(int(fields[19]))  # field 22: starttime
+    except (OSError, ValueError, IndexError):
         return None
 
 
@@ -93,7 +101,9 @@ def pid_alive(pid: int, start_time: float | None = None) -> bool:
         return False
     if start_time is None:
         return True
-    return abs(actual - start_time) >= 0 and abs(actual - start_time) < 10.0
+    # The fingerprint is stable (Linux starttime ticks or Windows creation
+    # time), so use a tight tolerance; a 10-second window can confuse PID reuse.
+    return abs(actual - start_time) < 0.5
 
 
 def lease_fingerprint() -> tuple[int, float]:
