@@ -89,6 +89,29 @@ class FakeWorkspace:
         self.kept.append(path)
 
 
+class PassedGateBundle:
+    status = "PASS"
+    checks = []
+    evidence_reused = 0
+    blockers = []
+
+    def write(self, path):
+        return None
+
+
+class PassedGate:
+    def __init__(self, **kwargs):
+        pass
+
+    def run(self, **kwargs):
+        return PassedGateBundle()
+
+
+def _stub_pass_gate(monkeypatch):
+    monkeypatch.setattr("dispatcher.dispatcher.build_probe", lambda **kwargs: None)
+    monkeypatch.setattr("dispatcher.dispatcher.VerificationGate", PassedGate)
+
+
 class FakeControl:
     def __init__(self, *, outcomes: list[dict[str, Any]] | None = None,
                  fail_sync: bool = False):
@@ -405,7 +428,8 @@ def test_workstream_isolation(env):
     assert sorted(report.claimed) == ["T-1", "T-2"]
 
 
-def test_checkout_created_when_repo_set(env):
+def test_checkout_created_when_repo_set(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-1", title="x", prompt_inline="p",
                                 repo="h4z4rd95/example")])
@@ -417,7 +441,8 @@ def test_checkout_created_when_repo_set(env):
     assert workspace.released
 
 
-def test_failed_run_keeps_workspace_for_same_task_resume(env):
+def test_failed_run_keeps_workspace_for_same_task_resume(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-RESUME", title="recover", prompt_inline="p",
                                 repo="h4z4rd95/example")])
@@ -436,6 +461,8 @@ def test_failed_run_keeps_workspace_for_same_task_resume(env):
     assert commit_calls == []
 
     # Retry keeps the same task-derived session identity and workspace path.
+    _write_inbox(control, [Task(id="T-RESUME", title="recover", prompt_inline="p",
+                                repo="h4z4rd95/example", status="READY")])
     store.reset_to_ready("T-RESUME", note="controlled retry")
     d._router = FakeRouter(runs=[FakeRun(session_id="session-resume", exit_code=0,
                                          resumed=True)])
