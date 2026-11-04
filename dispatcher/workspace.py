@@ -318,8 +318,41 @@ class WorkspaceManager:
         self._git(args, cwd=self.pool_root)
 
     def _sync(self, path: Path, branch: str) -> None:
-        """Refresh a reused checkout to the tip of ``branch``."""
+        """Refresh a clean checkout without destroying task recovery work.
+
+        A task workspace may contain uncommitted edits or local commits after
+        an interrupted Hermes run. Fetch remote metadata, but never reset such
+        a workspace. Only a clean checkout with no local commits is refreshed.
+        """
         self._git(["fetch", "--quiet", "origin"], cwd=path)
+        status = self._git(
+            ["status", "--porcelain", "--untracked-files=all"], cwd=path
+        ).stdout or ""
+        if status.strip():
+            self._log.warning(
+                "preserving dirty workspace for task recovery at %s; skipping reset",
+                path,
+            )
+            return
+
+        divergence = self._git(
+            ["rev-list", "--left-right", "--count", f"HEAD...origin/{branch}"],
+            cwd=path,
+        ).stdout or ""
+        try:
+            ahead, _behind = (int(value) for value in divergence.split())
+        except (TypeError, ValueError):
+            raise WorkspaceError(
+                f"cannot determine commit divergence for {path}; workspace preserved"
+            )
+
+        if ahead > 0:
+            self._log.warning(
+                "preserving workspace at %s with %d local commit(s) ahead of origin/%s",
+                path, ahead, branch,
+            )
+            return
+
         self._git(["checkout", branch], cwd=path)
         self._git(["reset", "--hard", f"origin/{branch}"], cwd=path)
 
@@ -362,9 +395,9 @@ class WorkspaceManager:
         """Clone (or reuse) a checkout for ``(task_id, repo, branch)``.
 
         Idempotent: an existing recorded checkout with a valid git directory is
-        reused with ``created=False`` after a fetch/checkout/reset to the tip of
-        ``branch``. Quota and free-space checks run *before* any clone and fail
-        closed.
+        reused with ``created=False``. Clean checkouts behind origin are
+        refreshed; dirty or locally-ahead work is preserved for recovery.
+        Quota and free-space checks run *before* any clone and fail closed.
         """
         self._validate(task_id, repo, branch)
         self._ensure()
