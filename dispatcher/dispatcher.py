@@ -704,7 +704,57 @@ class Dispatcher:
             evidence.append({"kind": "workspace", "path": str(checkout_path)})
         # Partial work must remain in the task workspace after an
         # interruption/failure; only a verified DONE run may auto-commit it.
-        commit_sha = self._maybe_task_commit(task) if status == "DONE" else ""
+        commit_sha = ""
+        if status == "DONE":
+            try:
+                commit_sha = self._maybe_task_commit(task)
+            except Exception as exc:
+                # A task is not DONE until its workspace commit is pushed.
+                # Keep the same workspace/session and retry within the task's
+                # bounded retry budget; never report an unpublished commit as
+                # successful.
+                latest_state = self.store.get(task.id)
+                commit_sha = latest_state.commit_sha if latest_state else ""
+                retry_available = state.attempts < task.max_retries
+                commit_status = "READY" if retry_available else "FAILED"
+                reason = f"commit/push failed: {type(exc).__name__}: {exc}"[:500]
+                self.store.release(
+                    task.id,
+                    status=commit_status,
+                    summary=reason,
+                    outcome={"evidence": evidence, "commit_sha": commit_sha},
+                    session_id=run.session_id,
+                    workspace_path=str(checkout_path) if checkout_path else state.workspace_path,
+                    commit_sha=commit_sha,
+                    error=reason,
+                )
+                if checkout_path is not None:
+                    try:
+                        self.workspace.keep(checkout_path)
+                    except Exception as keep_exc:
+                        self.log("warn", f"{task.id}: commit-failure workspace retention failed: {keep_exc}")
+                if retry_available:
+                    report.recovered.append((task.id, "commit/push failed; same task/session/workspace queued for retry"))
+                else:
+                    OutcomeRecord(
+                        task_id=task.id,
+                        status="FAILED",
+                        summary=reason,
+                        evidence=evidence,
+                        commit_sha=commit_sha,
+                        session_id=run.session_id,
+                        workspace_path=str(checkout_path) if checkout_path else state.workspace_path,
+                        source=task.source,
+                        error=reason,
+                    ).write(self.cfg.outcomes_dir)
+                    report.errors.append(f"{task.id}: {reason}")
+                return
+        # If a prior process committed before it was killed, the SHA is
+        # already durable in SQLite. A resumed no-diff run returns that SHA
+        # after retrying the idempotent push.
+        if not commit_sha:
+            latest_state = self.store.get(task.id)
+            commit_sha = latest_state.commit_sha if latest_state else ""
         self.store.release(
             task.id,
             status=status,
@@ -753,13 +803,25 @@ class Dispatcher:
         try:
             sub = _Git(path)
             if not sub.has_changes():
+                # A prior process may have committed and exited before it
+                # could publish the outcome. Retry the idempotent push and
+                # return the SHA persisted with that commit.
+                if state.commit_sha:
+                    sub.push()
+                    return state.commit_sha
                 return ""
             sha = sub.commit_all(f"chore(dispatcher): task {task.id} — {task.title}")
+            # Persist the commit identity before the network push. If the
+            # process is killed after git commit (or during push), recovery
+            # can find the same workspace, retry push, and publish the exact
+            # SHA instead of completing with an unreferenced commit.
+            state.commit_sha = sha
+            self.store.upsert(state)
             sub.push()
             return sha
         except Exception as exc:
             self.log("warn", f"{task.id}: commit/push failed: {exc}")
-            return ""
+            raise
 
     # --- outcome spool ingestion --------------------------------------------
 

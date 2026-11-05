@@ -827,3 +827,75 @@ def test_outcome_source_absent_for_owner_hand_tasks(env):
     d.tick()
     written = [w for w in control_repo.written if w["task_id"] == "T-HAND"]
     assert written and written[-1]["source"] == ""
+
+
+
+def test_commit_sha_is_persisted_before_push(env, monkeypatch, tmp_path):
+    """A hard exit during push must not erase the already-created commit SHA."""
+    d, cfg, store, router, workspace, control_repo, control = env
+    path = tmp_path / "workspace"
+    path.mkdir()
+    task = Task(id="T-COMMIT-DURABLE", title="durable commit", prompt_inline="p")
+    store.upsert(TaskState(task_id=task.id, status="RUNNING", workspace_path=str(path)))
+    observed = []
+
+    class FakeGit:
+        def __init__(self, repo):
+            assert Path(repo) == path
+        def has_changes(self):
+            return True
+        def commit_all(self, message):
+            return "commit-sha-before-push"
+        def push(self):
+            observed.append(store.get(task.id).commit_sha)
+            raise RuntimeError("simulated push interruption")
+
+    monkeypatch.setattr("dispatcher.dispatcher._Git", FakeGit)
+    with pytest.raises(RuntimeError, match="simulated push interruption"):
+        d._maybe_task_commit(task)
+    assert observed == ["commit-sha-before-push"]
+    assert store.get(task.id).commit_sha == "commit-sha-before-push"
+
+
+def test_recovered_commit_sha_is_in_spooled_outcome(env):
+    import json
+
+    d, cfg, store, router, workspace, control_repo, control = env
+    task = Task(id="T-COMMIT-RECOVER", title="publish recovered SHA", prompt_inline="Reply PONG")
+    _write_inbox(control, [task])
+    store.upsert(TaskState(task_id=task.id, status="READY", commit_sha="commit-sha-recovered"))
+    d._maybe_task_commit = lambda task: ""
+
+    report = d.tick()
+    assert report.completed == [task.id]
+    assert store.get(task.id).commit_sha == "commit-sha-recovered"
+    spool = cfg.outcomes_dir / f"{task.id}.json"
+    assert json.loads(spool.read_text(encoding="utf-8"))["commit_sha"] == "commit-sha-recovered"
+    assert control_repo.written[-1]["commit_sha"] == "commit-sha-recovered"
+
+
+
+def test_commit_push_failure_requeues_same_workspace(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
+    d, cfg, store, router, workspace, control_repo, control = env
+    task = Task(id="T-COMMIT-PUSH-RETRY", title="retry rejected push", prompt_inline="Reply PONG",
+                repo="h4z4rd95/fixture", session="commit-push-session", max_retries=3)
+    _write_inbox(control, [task])
+
+    def fail_push(task):
+        state = store.get(task.id)
+        state.commit_sha = "durable-local-commit"
+        store.upsert(state)
+        raise RuntimeError("remote rejected push")
+
+    d._maybe_task_commit = fail_push
+    report = d.tick()
+    state = store.get(task.id)
+    assert state.status == "READY"
+    assert state.attempts == 1
+    assert state.commit_sha == "durable-local-commit"
+    assert state.session_id == "20261005_000000_abcdef"
+    assert state.workspace_path.endswith(task.id)
+    assert report.completed == []
+    assert report.recovered == [(task.id, "commit/push failed; same task/session/workspace queued for retry")]
+    assert workspace.kept == [Path(f"/tmp/fake/{task.id}")]
