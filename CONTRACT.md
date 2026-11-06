@@ -62,7 +62,7 @@ requires_approval = false
 approval_note    = ""
 dependencies     = ["T-..."]
 max_retries      = 2
-timeout_seconds  = 900
+timeout_seconds  = 1500
 model            = ""                    # optional model override
 ```
 
@@ -238,6 +238,8 @@ monitors sessions.message_count, last_activity_at, and ended_at:
 - Default idle threshold: 300 seconds without a new message/activity.
 - Default polling interval: 5 seconds.
 - Default maximum: 2 continuation nudges per invocation.
+- Default hard task budget: 1500 seconds (the existing tick ceiling); tasks
+  with active message progress are not cut off at the five-minute idle mark.
 - At the idle threshold, only when the session is still open and the message
   counter/activity has not advanced, the router interrupts the stalled CLI
   turn and resumes the SAME named session and workspace with a continuation

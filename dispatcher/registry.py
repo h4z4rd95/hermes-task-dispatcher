@@ -89,7 +89,7 @@ class Task:
     read_paths: list[str] = field(default_factory=list)
     shared_resources: list[str] = field(default_factory=list)
     max_retries: int = 2
-    timeout_seconds: int = 900
+    timeout_seconds: int = 1500
     model: str = ""
     purpose: str = ""
     result_note: str = ""
