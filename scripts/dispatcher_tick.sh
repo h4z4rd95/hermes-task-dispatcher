@@ -67,6 +67,31 @@ else
 fi
 unset _CANDIDATE_PY
 
+# Supervisor resource-manifest preflight runs inside the existing 5-minute
+# Dispatcher cron tick, before the normal claim loop. It uses the existing
+# control-repo checkout and A2A Supervisor; no second queue/cron/service.
+# Missing or failed preflight blocks this tick (fail closed).
+CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"
+if [ ! -d "$CONTROL_REPO/.git" ]; then
+  echo "dispatcher tick blocked: control repo checkout missing at $CONTROL_REPO" >&2
+  exit 2
+fi
+PREFLIGHT="$CONTROL_REPO/supervisor/intake/resource_manifest_preflight.py"
+if [ ! -f "$PREFLIGHT" ]; then
+  echo "dispatcher tick blocked: Supervisor resource-manifest preflight is not installed" >&2
+  exit 2
+fi
+if command -v timeout >/dev/null 2>&1; then
+  timeout -s KILL 240 "$PY" "$PREFLIGHT" --control-repo "$CONTROL_REPO" --limit 5 --wait-seconds 120
+else
+  "$PY" "$PREFLIGHT" --control-repo "$CONTROL_REPO" --limit 5 --wait-seconds 120
+fi
+preflight_status=$?
+if [ "$preflight_status" -ne 0 ]; then
+  echo "dispatcher tick blocked: Supervisor resource-manifest preflight failed ($preflight_status)" >&2
+  exit "$preflight_status"
+fi
+
 # Outermost guard: no tick may hang. The in-process budget
 # (DISPATCHER_TICK_BUDGET_S, default 1500s) is the primary bound, but a
 # subprocess wedged in the OS (a hung git/child handle, a blocked C-level
