@@ -228,3 +228,32 @@ Notes:
 - `.gitignore` must exclude `state/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`.
 - Implementation commits go to `hermes-task-dispatcher` only. Governance doc
   updates to `Plan-Project-Situation` are the lead's job, done separately.
+
+## Progress-aware Hermes execution (2026-11-06)
+
+A task is NOT killed merely because five minutes elapsed. The SessionRouter
+reads the active Hermes session row from the same profile's state.db and
+monitors sessions.message_count, last_activity_at, and ended_at:
+
+- Default idle threshold: 300 seconds without a new message/activity.
+- Default polling interval: 5 seconds.
+- Default maximum: 2 continuation nudges per invocation.
+- At the idle threshold, only when the session is still open and the message
+  counter/activity has not advanced, the router interrupts the stalled CLI
+  turn and resumes the SAME named session and workspace with a continuation
+  instruction to inspect current changes, continue the original acceptance
+  criteria, and commit/push/fetch-back if the work is complete.
+- A terminal session (ended_at set) is allowed to flush its result; it is not
+  interrupted. If the session store cannot be read or no matching session row
+  exists, the watchdog fails closed and does not infer idleness.
+- The task's configured timeout_seconds and the tick's tick_budget_s remain
+  hard safety ceilings. They are not the five-minute idle threshold.
+
+Environment overrides:
+DISPATCHER_IDLE_TIMEOUT_SECONDS (300),
+DISPATCHER_MONITOR_INTERVAL_SECONDS (5),
+DISPATCHER_MAX_IDLE_RECOVERIES (2).
+
+The outcome evidence records continuation count and the last observed
+message_count, so a later reviewer can distinguish active progress,
+watchdog continuation, terminal completion and hard-ceiling timeout.

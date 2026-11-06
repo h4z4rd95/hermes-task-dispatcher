@@ -26,6 +26,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -216,6 +218,8 @@ class RunResult:
     # Extra fields the dispatcher may want without re-parsing stdout. Not part
     # of the CONTRACT.md signature; safe to ignore.
     timed_out: bool = field(default=False, metadata={"internal": True})
+    idle_recoveries: int = field(default=0, metadata={"internal": True})
+    message_count: int | None = field(default=None, metadata={"internal": True})
 
 
 class SessionRouter:
@@ -240,6 +244,10 @@ class SessionRouter:
         # do not resolve eagerly or test fixtures would need a real hermes.
         self._bin = HERMES_BIN
         self._runner: _Runner = _default_runner
+        self._popen_factory = subprocess.Popen
+        self._progress_reader = self._read_session_progress
+        self._force_idle_watchdog = False
+        self.supports_idle_watchdog = True
 
     # ------------------------------------------------------------------ #
     # Test seam
@@ -329,6 +337,9 @@ class SessionRouter:
         model: str | None = None,
         max_turns: int | None = None,
         run_budget_s: int | None = None,
+        idle_timeout_s: int = 300,
+        monitor_interval_s: float = 5.0,
+        max_idle_recoveries: int = 2,
     ) -> RunResult:
         """Run *prompt* in the session named *session_name*.
 
@@ -377,6 +388,23 @@ class SessionRouter:
 
         _PROMPT_HOLDER[0] = prompt
         started = time.monotonic()
+        if (self._runner is _default_runner or self._force_idle_watchdog) and idle_timeout_s > 0:
+            try:
+                return self._run_with_idle_watchdog(
+                    cmd=cmd,
+                    session_name=session_name,
+                    prompt=prompt,
+                    model=model,
+                    run_budget_s=run_budget_s,
+                    idle_timeout_s=idle_timeout_s,
+                    monitor_interval_s=monitor_interval_s,
+                    max_idle_recoveries=max_idle_recoveries,
+                    started=started,
+                    session_exists=bool(session_exists),
+                )
+            finally:
+                _PROMPT_HOLDER[0] = ""
+
         timed_out = False
         # Never run unbounded, even if the caller passed no budget: a session
         # with no ceiling can hang on a network read and wedge the whole
@@ -442,6 +470,275 @@ class SessionRouter:
             resumed=_detect_resumed(stdout),
             timed_out=timed_out,
         )
+
+    # ------------------------------------------------------------------ #
+    # Progress-aware execution
+    # ------------------------------------------------------------------ #
+    def _read_session_progress(self, session_name: str, env: dict[str, str] | None = None):
+        """Read the same message counter shown by the Hermes session UI.
+
+        The probe is read-only and fail-closed: if the session store cannot be
+        read, the watchdog never interrupts a possibly active model/tool call.
+        """
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class Progress:
+            session_id: str
+            message_count: int
+            last_activity_at: float
+            ended_at: float | None
+            end_reason: str | None
+
+        env = env or self._child_env()
+        home = Path(env.get("HERMES_HOME") or Path.home() / ".hermes")
+        profile = env.get("HERMES_PROFILE") or env.get("HERMES_PROFILE_NAME")
+        candidates = []
+        if profile and profile not in ("default", "main"):
+            candidates.append(home / "profiles" / profile / "state.db")
+        candidates.append(home / "state.db")
+        for db in candidates:
+            if not db.is_file():
+                continue
+            try:
+                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+                try:
+                    row = con.execute(
+                        """SELECT id, COALESCE(message_count, 0),
+                                  COALESCE(last_activity_at, 0), ended_at, end_reason
+                           FROM sessions WHERE title = ?
+                           ORDER BY started_at DESC LIMIT 1""",
+                        (session_name,),
+                    ).fetchone()
+                finally:
+                    con.close()
+                if row:
+                    return Progress(
+                        session_id=str(row[0]),
+                        message_count=int(row[1] or 0),
+                        last_activity_at=float(row[2] or 0),
+                        ended_at=float(row[3]) if row[3] is not None else None,
+                        end_reason=str(row[4]) if row[4] else None,
+                    )
+            except (sqlite3.Error, OSError) as exc:
+                self._log(f"session progress probe unavailable for {session_name!r}: {exc}")
+                return None
+        return None
+
+    @staticmethod
+    def _idle_continuation_prompt(idle_seconds: int, recovery_number: int) -> str:
+        return (
+            "[DISPATCHER IDLE-WATCHDOG CONTINUATION]\n"
+            f"The previous invocation produced no new Hermes session messages for {idle_seconds} seconds "
+            "and did not publish a terminal result. This is a continuation of the SAME task, not a new task.\n"
+            "Continue from the existing conversation, current repository workspace and existing changes. "
+            "Do not reset, clean, recreate, or discard the workspace. First inspect the current git status "
+            "and diff, then continue the original acceptance criteria without repeating completed work.\n"
+            "If implementation is complete, finish the required focused validation, commit and push the "
+            "changes, independently fetch the remote branch/file state, and report the full commit SHA. "
+            "If not complete, make the next concrete in-scope change. If blocked, preserve all work and "
+            "report the exact blocker and remaining criterion. Do not claim DONE without durable evidence.\n"
+            f"Watchdog continuation {recovery_number}; keep the original task scope and safety boundaries."
+        )
+
+    def _run_with_idle_watchdog(
+        self, *, cmd: list[str], session_name: str, prompt: str,
+        model: str | None, run_budget_s: int | None, idle_timeout_s: int,
+        monitor_interval_s: float, max_idle_recoveries: int,
+        started: float, session_exists: bool,
+    ) -> RunResult:
+        """Run Hermes while watching its persisted message_count/last_activity.
+
+        A five-minute quiet session is nudged by interrupting the stalled CLI
+        turn and resuming the same named session with a continuation prompt.
+        A hard wall-clock ceiling remains as the final safety boundary.
+        """
+        hard_budget = float(run_budget_s) if run_budget_s else 120.0
+        deadline = started + max(hard_budget, 1.0)
+        interval = max(0.25, float(monitor_interval_s or 5.0))
+        recoveries = 0
+        outputs: list[str] = []
+        last_progress = time.monotonic()
+        last_count: int | None = None
+        last_activity: float | None = None
+        latest_session_id = ""
+        current_prompt = prompt
+        current_cmd = list(cmd)
+        current_resumed = session_exists
+
+        while True:
+            recoveries_before_invocation = recoveries
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return RunResult(
+                    session_id=latest_session_id, exit_code=124,
+                    stdout="".join(outputs), duration_s=time.monotonic() - started,
+                    resumed=current_resumed, timed_out=True,
+                    idle_recoveries=recoveries,
+                    message_count=last_count,
+                )
+            try:
+                proc = self._popen_factory(
+                    current_cmd, cwd=self.workdir, env=self._child_env(),
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                    errors="replace", bufsize=1,
+                )
+            except OSError as exc:
+                raise RouterError(f"could not start Hermes session {session_name!r}: {exc}") from exc
+
+            invocation_started = time.monotonic()
+            snapshot = self._progress_reader(session_name, self._child_env())
+            if snapshot:
+                latest_session_id = snapshot.session_id or latest_session_id
+                last_count = snapshot.message_count
+                last_activity = snapshot.last_activity_at or None
+            last_progress = invocation_started
+            first_communicate = True
+            invocation_output = ""
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._interrupt_process(proc)
+                    try:
+                        invocation_output, _ = proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self._stop_process(proc)
+                        invocation_output, _ = proc.communicate()
+                    outputs.append(invocation_output or "")
+                    return RunResult(
+                        session_id=latest_session_id or _parse_session_id("".join(outputs)),
+                        exit_code=124, stdout="".join(outputs),
+                        duration_s=time.monotonic() - started,
+                        resumed=current_resumed, timed_out=True,
+                        idle_recoveries=recoveries, message_count=last_count,
+                    )
+
+                try:
+                    invocation_output, _ = proc.communicate(
+                        input=current_prompt if first_communicate else None,
+                        timeout=min(interval, remaining),
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    first_communicate = False
+                    current = self._progress_reader(session_name, self._child_env())
+                    if current:
+                        latest_session_id = current.session_id or latest_session_id
+                        changed = (
+                            last_count is None
+                            or current.message_count != last_count
+                            or (last_activity is not None and current.last_activity_at > last_activity)
+                        )
+                        if changed:
+                            last_progress = time.monotonic()
+                            last_count = current.message_count
+                            last_activity = current.last_activity_at
+                        if current.ended_at is not None:
+                            # Hermes has finalized the session; wait for the CLI
+                            # to flush its final result instead of sending a nudge.
+                            last_progress = time.monotonic()
+                            continue
+
+                    if time.monotonic() - last_progress < idle_timeout_s:
+                        continue
+
+                    # Re-read immediately before interrupting to close the race
+                    # where a message arrived between the previous poll and the
+                    # idle threshold.
+                    confirm = self._progress_reader(session_name, self._child_env())
+                    if not confirm or confirm.ended_at is not None:
+                        last_progress = time.monotonic()
+                        continue
+                    if (last_count is None or confirm.message_count != last_count
+                            or (last_activity is not None and confirm.last_activity_at > last_activity)):
+                        last_count = confirm.message_count
+                        last_activity = confirm.last_activity_at
+                        last_progress = time.monotonic()
+                        continue
+
+                    if recoveries >= max(0, int(max_idle_recoveries)):
+                        self._log(
+                            f"session={session_name!r} idle watchdog reached {recoveries} continuations; "
+                            "stopping at the safety limit"
+                        )
+                        self._interrupt_process(proc)
+                        try:
+                            invocation_output, _ = proc.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            self._stop_process(proc)
+                            invocation_output, _ = proc.communicate()
+                        outputs.append(invocation_output or "")
+                        return RunResult(
+                            session_id=latest_session_id or confirm.session_id,
+                            exit_code=124, stdout="".join(outputs),
+                            duration_s=time.monotonic() - started,
+                            resumed=current_resumed, timed_out=True,
+                            idle_recoveries=recoveries, message_count=last_count,
+                        )
+
+                    self._log(
+                        f"session={session_name!r} idle for {idle_timeout_s}s at "
+                        f"message_count={confirm.message_count}; sending continuation {recoveries + 1}"
+                    )
+                    self._interrupt_process(proc)
+                    try:
+                        invocation_output, _ = proc.communicate(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        self._stop_process(proc)
+                        invocation_output, _ = proc.communicate()
+                    outputs.append(invocation_output or "")
+                    recoveries += 1
+                    current_prompt = self._idle_continuation_prompt(idle_timeout_s, recoveries)
+                    current_cmd = self._build_cmd(
+                        session_name=session_name, model=model, max_turns=None,
+                        run_budget_s=None, resume_by_name=True, is_fresh=False,
+                    )
+                    current_resumed = True
+                    last_progress = time.monotonic()
+                    break
+
+            if recoveries > recoveries_before_invocation:
+                # The previous process was interrupted and its output already
+                # captured. Start the continuation in the same named session.
+                continue
+
+            outputs.append(invocation_output or "")
+            parsed_id = _parse_session_id(invocation_output or "")
+            if parsed_id:
+                latest_session_id = parsed_id
+            if proc.returncode == 0 and not latest_session_id:
+                raise RouterError(
+                    f"hermes run for session {session_name!r} produced no session_id line "
+                    "and the session store had no matching row"
+                )
+            if not _NEW_SESSION_FLAGS_SUPPORTED and not session_exists and latest_session_id:
+                self._rename_session(latest_session_id, session_name)
+            return RunResult(
+                session_id=latest_session_id, exit_code=int(proc.returncode or 0),
+                stdout="".join(outputs), duration_s=time.monotonic() - started,
+                resumed=current_resumed or _detect_resumed("".join(outputs)),
+                timed_out=False, idle_recoveries=recoveries,
+                message_count=last_count,
+            )
+
+    @staticmethod
+    def _interrupt_process(proc) -> None:
+        try:
+            proc.send_signal(signal.SIGINT)
+        except (OSError, ProcessLookupError):
+            pass
+
+    @staticmethod
+    def _stop_process(proc) -> None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # Internals

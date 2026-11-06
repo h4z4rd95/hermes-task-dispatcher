@@ -63,6 +63,12 @@ class Config:
     # Scheduling identifiers registered with `hermes cron`.
     cron_job_name: str
 
+    # Progress-aware Hermes run controls. Defaults preserve the five-minute
+    # owner requirement without changing cron cadence or max concurrency.
+    idle_timeout_s: int = 300
+    max_idle_recoveries: int = 2
+    monitor_interval_s: float = 5.0
+
     @property
     def inbox_path(self) -> Path:
         return self.control_repo / self.inbox_rel
@@ -153,6 +159,9 @@ def config() -> Config:
         # recurring interval times the number of missed fires the scheduler may
         # catch up in sequence, so a tick can never wedge the scheduler.
         tick_budget_s=int(os.environ.get("DISPATCHER_TICK_BUDGET_S", "1500")),
+        idle_timeout_s=int(os.environ.get("DISPATCHER_IDLE_TIMEOUT_SECONDS", "300")),
+        max_idle_recoveries=int(os.environ.get("DISPATCHER_MAX_IDLE_RECOVERIES", "2")),
+        monitor_interval_s=float(os.environ.get("DISPATCHER_MONITOR_INTERVAL_SECONDS", "5")),
         global_workspace_quota_mb=int(os.environ.get("DISPATCHER_WORKSPACE_QUOTA_MB", "20480")),
         stale_lease_seconds=int(os.environ.get("DISPATCHER_STALE_LEASE_SECONDS", "900")),
         worker_spawn=_env_flag("DISPATCHER_WORKER_SPAWN", default=True),

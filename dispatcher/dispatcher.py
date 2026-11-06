@@ -657,12 +657,19 @@ class Dispatcher:
             _extra["DISPATCHER_TASK_DEPTH"] = str(_depth + 1)
             _extra["DISPATCHER_TASK_ID"] = task.id
 
-        run = self.router.run(
-            session_name=session_name,
-            prompt=prompt,
-            model=task.model or None,
-            run_budget_s=run_budget_s,
-        )
+        run_kwargs = {
+            "session_name": session_name,
+            "prompt": prompt,
+            "model": task.model or None,
+            "run_budget_s": run_budget_s,
+        }
+        if getattr(self.router, "supports_idle_watchdog", False):
+            run_kwargs.update({
+                "idle_timeout_s": self.cfg.idle_timeout_s,
+                "monitor_interval_s": self.cfg.monitor_interval_s,
+                "max_idle_recoveries": self.cfg.max_idle_recoveries,
+            })
+        run = self.router.run(**run_kwargs)
         state.session_id = run.session_id
         self.store.upsert(state)
         if checkout_path is not None and run.session_id:
@@ -688,7 +695,9 @@ class Dispatcher:
                  "resumed": run.resumed},
                 {"kind": "run", "exit_code": run.exit_code,
                  "duration_s": round(run.duration_s, 1),
-                 "timed_out": bool(getattr(run, "timed_out", False))},
+                 "timed_out": bool(getattr(run, "timed_out", False)),
+                 "idle_recoveries": int(getattr(run, "idle_recoveries", 0)),
+                 "message_count": getattr(run, "message_count", None)},
             ]
             if checkout_path is not None:
                 recovery_evidence.append({"kind": "workspace", "path": str(checkout_path)})
@@ -803,6 +812,9 @@ class Dispatcher:
         evidence = [
             {"kind": "session", "session_id": run.session_id, "resumed": run.resumed},
             {"kind": "run", "exit_code": run.exit_code, "duration_s": round(run.duration_s, 1)},
+            {"kind": "idle_watchdog", "idle_seconds": self.cfg.idle_timeout_s,
+             "continuations": int(getattr(run, "idle_recoveries", 0)),
+             "message_count": getattr(run, "message_count", None)},
             {"kind": "gate", "status": gate_status, "tier": gate_tier,
              "bundle": gate_bundle_path},
         ]
