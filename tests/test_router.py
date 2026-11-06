@@ -603,3 +603,105 @@ def test_legacy_cli_drops_unsupported_flags(monkeypatch):
     cmd = [c for c in runner.calls if c["cmd"][1] == "chat"][0]["cmd"]
     for flag in ("--in", "--run-budget", "--query-file"):
         assert flag not in cmd
+
+
+
+
+def test_idle_watchdog_interrupts_and_continues_same_session():
+    """A quiet session gets a continuation in the same named Hermes session."""
+    import signal
+    import subprocess
+    from types import SimpleNamespace
+
+    calls = []
+    captured_inputs = []
+
+    class FakeProcess:
+        def __init__(self, index):
+            self.index = index
+            self.returncode = None
+
+        def communicate(self, input=None, timeout=None):
+            if input is not None:
+                captured_inputs.append(input)
+            if self.index == 0 and self.returncode is None:
+                raise subprocess.TimeoutExpired("fake-hermes", timeout)
+            if self.index == 0:
+                return ("interrupted first turn\n", None)
+            self.returncode = 0
+            return ("session_id: fake-session\n", None)
+
+        def send_signal(self, sig):
+            assert sig == signal.SIGINT
+            self.returncode = -signal.SIGINT
+
+        def terminate(self):
+            self.returncode = -signal.SIGTERM
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -signal.SIGKILL
+
+    router = SessionRouter()
+    router.session_name_exists = lambda _name: False
+    router._force_idle_watchdog = True
+    router._progress_reader = lambda *_args: SimpleNamespace(
+        session_id="fake-session",
+        message_count=4,
+        last_activity_at=100.0,
+        ended_at=None,
+        end_reason=None,
+    )
+
+    def fake_popen(*_args, **_kwargs):
+        process = FakeProcess(len(calls))
+        calls.append(process)
+        return process
+
+    router._popen_factory = fake_popen
+    result = router.run(
+        session_name="idle-watchdog-test",
+        prompt="Complete the bounded task.",
+        run_budget_s=5,
+        idle_timeout_s=0.02,
+        monitor_interval_s=0.005,
+        max_idle_recoveries=1,
+    )
+    assert len(calls) == 2
+    assert result.exit_code == 0
+    assert result.session_id == "fake-session"
+    assert result.idle_recoveries == 1
+    assert result.message_count == 4
+    assert len(captured_inputs) == 2
+    assert "Complete the bounded task." in captured_inputs[0]
+    assert "IDLE-WATCHDOG CONTINUATION" in captured_inputs[1]
+
+
+def test_session_progress_reads_message_count_and_terminal_state(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        """CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, title TEXT, message_count INTEGER,
+            last_activity_at REAL, ended_at REAL, end_reason TEXT,
+            started_at REAL
+        )"""
+    )
+    con.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("sid-1", "progress-test", 17, 1234.5, None, None, 1000.0),
+    )
+    con.commit()
+    con.close()
+
+    router = SessionRouter(extra_env={"HERMES_HOME": str(tmp_path)})
+    progress = router._read_session_progress("progress-test")
+    assert progress is not None
+    assert progress.session_id == "sid-1"
+    assert progress.message_count == 17
+    assert progress.last_activity_at == 1234.5
+    assert progress.ended_at is None

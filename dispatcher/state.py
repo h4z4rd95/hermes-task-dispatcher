@@ -141,6 +141,10 @@ class TaskState:
     # Persisted so a repeated non-actionable skip is logged once per change
     # instead of every tick (Issue #23).
     last_skip_reason: str = ""
+    # Conflict-aware scheduling (v4): the branch head the task's resource
+    # manifest was last evaluated against. Refreshed from the remote before
+    # claim (SERIAL_AFTER re-evaluation); empty until first refresh.
+    baseline_sha: str = ""
     updated_at: float = _now()
 
     def to_row(self) -> dict[str, Any]:
@@ -159,6 +163,7 @@ class TaskState:
             "workspace_path": self.workspace_path,
             "commit_sha": self.commit_sha,
             "last_skip_reason": self.last_skip_reason,
+            "baseline_sha": self.baseline_sha,
             "updated_at": self.updated_at,
         }
 
@@ -179,6 +184,7 @@ class TaskState:
             workspace_path=row["workspace_path"] or "",
             commit_sha=row["commit_sha"] or "",
             last_skip_reason=row["last_skip_reason"] if "last_skip_reason" in row.keys() else "",
+            baseline_sha=row["baseline_sha"] if "baseline_sha" in row.keys() else "",
             updated_at=row["updated_at"],
         )
 
@@ -199,7 +205,41 @@ CREATE TABLE IF NOT EXISTS task_state (
     workspace_path  TEXT NOT NULL DEFAULT '',
     commit_sha      TEXT NOT NULL DEFAULT '',
     last_skip_reason TEXT NOT NULL DEFAULT '',
+    baseline_sha    TEXT NOT NULL DEFAULT '',
     updated_at      REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scheduling_decisions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               REAL NOT NULL,
+    run_id           TEXT NOT NULL DEFAULT '',
+    task_id          TEXT NOT NULL,
+    decision         TEXT NOT NULL,
+    predecessor      TEXT NOT NULL DEFAULT '',
+    resource         TEXT NOT NULL DEFAULT '',
+    lock_owner       TEXT NOT NULL DEFAULT '',
+    compared_task_ids TEXT NOT NULL DEFAULT '[]',
+    baseline_sha     TEXT NOT NULL DEFAULT '',
+    manifest_sha     TEXT NOT NULL DEFAULT '',
+    resource_keys    TEXT NOT NULL DEFAULT '[]',
+    conflict_paths   TEXT NOT NULL DEFAULT '[]',
+    reasons          TEXT NOT NULL DEFAULT '[]',
+    wait_condition   TEXT NOT NULL DEFAULT '',
+    reeval           TEXT NOT NULL DEFAULT ''
+);
+-- Duplicate-tick idempotency: the same task, unchanged manifest and
+-- unchanged comparison set yield at most one stored decision per distinct
+-- decision value. Re-evaluations (reeval != '') always append.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sched_dedup
+    ON scheduling_decisions(task_id, manifest_sha, compared_task_ids, decision, reeval);
+CREATE TABLE IF NOT EXISTS resource_locks (
+    resource      TEXT PRIMARY KEY,
+    owner_task    TEXT NOT NULL,
+    state         TEXT NOT NULL DEFAULT 'HELD',
+    lease_pid     INTEGER,
+    lease_start   REAL,
+    lease_expiry  REAL,
+    updated_at    REAL NOT NULL,
+    note          TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -251,6 +291,15 @@ class StateStore:
                 )
             except sqlite3.OperationalError:
                 pass
+            # baseline_sha (conflict-aware scheduling, 2026-11-06): the branch
+            # head each task's resource manifest was last evaluated against.
+            try:
+                conn.execute(
+                    "ALTER TABLE task_state ADD COLUMN baseline_sha "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass
 
     def all_states(self) -> dict[str, TaskState]:
         with self._conn() as conn:
@@ -288,6 +337,127 @@ class StateStore:
                 "UPDATE task_state SET last_skip_reason = ? WHERE task_id = ?",
                 (reason, task_id),
             )
+
+    # --- conflict-aware scheduling (v4) ---------------------------------------
+
+    def set_baseline(self, task_id: str, sha: str) -> None:
+        """Persist the branch head a task's manifest was evaluated against."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE task_state SET baseline_sha = ?, updated_at = ? "
+                "WHERE task_id = ?",
+                (sha, _now(), task_id),
+            )
+
+    def record_scheduling_decision(self, rec: dict[str, Any]) -> int:
+        """Append one admission decision; idempotent on unchanged inputs.
+
+        Returns 1 when a row was inserted, 0 when an identical decision
+        (same task + manifest + comparison set + decision + reeval) already
+        exists — a duplicate tick with no state change appends nothing.
+        """
+        cols = ("ts", "run_id", "task_id", "decision", "predecessor", "resource",
+                "lock_owner", "compared_task_ids", "baseline_sha", "manifest_sha",
+                "resource_keys", "conflict_paths", "reasons", "wait_condition",
+                "reeval")
+        with self._conn() as conn:
+            cur = conn.execute(
+                f"INSERT OR IGNORE INTO scheduling_decisions "
+                f"({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                tuple(rec.get(c, "") for c in cols),
+            )
+            return cur.rowcount
+
+    def latest_scheduling_decision(self, task_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduling_decisions WHERE task_id = ? "
+                "ORDER BY id DESC LIMIT 1", (task_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def acquire_resource_lock(self, task_id: str, resource: str,
+                              lease_seconds: int) -> tuple[bool, str]:
+        """Idempotent single-writer lock on a shared mutable resource.
+
+        Returns (granted, current_owner). A stale lock is reclaimed only
+        after BOTH conditions hold: the owner task is terminal in the task
+        ledger AND the lock's own lease is expired or its owner process is
+        dead. A non-terminal owner (e.g. a crashed-but-unreaped worker)
+        keeps the lock: the dispatcher's own lease recovery decides when the
+        owner becomes terminal, and only then may the lock move.
+        """
+        pid, started = lease_fingerprint()
+        now = _now()
+        expiry = now + max(lease_seconds, 60)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM resource_locks WHERE resource = ?", (resource,)
+            ).fetchone()
+            if row is None or row["state"] != "HELD":
+                conn.execute(
+                    """INSERT INTO resource_locks
+                       (resource, owner_task, state, lease_pid, lease_start,
+                        lease_expiry, updated_at, note)
+                       VALUES (?, ?, 'HELD', ?, ?, ?, ?, 'acquired')
+                       ON CONFLICT(resource) DO UPDATE SET
+                         owner_task = excluded.owner_task,
+                         state = 'HELD',
+                         lease_pid = excluded.lease_pid,
+                         lease_start = excluded.lease_start,
+                         lease_expiry = excluded.lease_expiry,
+                         updated_at = excluded.updated_at,
+                         note = 'acquired'""",
+                    (resource, task_id, pid, started, expiry, now),
+                )
+                return True, task_id
+            owner = row["owner_task"]
+            if owner == task_id:
+                # Idempotent re-acquire: refresh the lease, keep ownership.
+                conn.execute(
+                    "UPDATE resource_locks SET lease_pid = ?, lease_start = ?, "
+                    "lease_expiry = ?, updated_at = ? WHERE resource = ?",
+                    (pid, started, expiry, now, resource),
+                )
+                return True, task_id
+            owner_state = conn.execute(
+                "SELECT status FROM task_state WHERE task_id = ?", (owner,)
+            ).fetchone()
+            owner_terminal = bool(owner_state) and owner_state["status"] in TERMINAL
+            lease_expired = now > (row["lease_expiry"] or 0)
+            owner_alive = pid_alive(row["lease_pid"] or 0, row["lease_start"])
+            if owner_terminal and (lease_expired or not owner_alive):
+                conn.execute(
+                    """INSERT INTO resource_locks
+                       (resource, owner_task, state, lease_pid, lease_start,
+                        lease_expiry, updated_at, note)
+                       VALUES (?, ?, 'HELD', ?, ?, ?, ?, ?)
+                       ON CONFLICT(resource) DO UPDATE SET
+                         owner_task = excluded.owner_task,
+                         state = 'HELD',
+                         lease_pid = excluded.lease_pid,
+                         lease_start = excluded.lease_start,
+                         lease_expiry = excluded.lease_expiry,
+                         updated_at = excluded.updated_at,
+                         note = excluded.note""",
+                    (resource, task_id, pid, started, expiry, now,
+                     f"stale lock reclaimed (owner {owner} terminal, "
+                     f"lease {'expired' if lease_expired else 'dead'})"),
+                )
+                return True, task_id
+            return False, owner
+
+    def release_resource_locks(self, task_id: str) -> int:
+        """Release every lock owned by a task. Idempotent no-op if none."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE resource_locks SET state = 'RELEASED', owner_task = '', "
+                "lease_pid = NULL, lease_start = NULL, lease_expiry = NULL, "
+                "updated_at = ?, note = 'released (task terminal)' "
+                "WHERE owner_task = ? AND state = 'HELD'",
+                (_now(), task_id),
+            )
+            return cur.rowcount
 
     # --- leases -------------------------------------------------------------
 

@@ -48,7 +48,7 @@ def test_defaults_match_contract():
     assert t.branch == "main"
     assert t.parallel_safe is True
     assert t.max_retries == 2
-    assert t.timeout_seconds == 900
+    assert t.timeout_seconds == 1500
     assert t.is_terminal is False
     assert t.needs_checkout is False
 

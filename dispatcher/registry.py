@@ -46,7 +46,7 @@ _STR_FIELDS = {
 _DICT_FIELDS = {"runtime_probe"}
 _BOOL_FIELDS = {"parallel_safe", "keep_workspace", "requires_approval",
                 "spawn_allowed"}
-_LIST_FIELDS = {"dependencies"}
+_LIST_FIELDS = {"dependencies", "write_paths", "read_paths", "shared_resources"}
 
 
 class InboxError(ValueError):
@@ -79,8 +79,17 @@ class Task:
     requires_approval: bool = False
     approval_note: str = ""
     dependencies: list[str] = field(default_factory=list)
+    # Conflict-aware scheduling (v4, 2026-11-06): owner-declared resource
+    # surface. Expected write paths (repo-relative), relevant read paths and
+    # shared mutable resources that may live in OTHER repositories
+    # (e.g. "runtime:dokploy-nginx", "db:marketdata"). All optional; the
+    # scheduler treats a repo task with no declared/derivable write set as
+    # unscoped and refuses to prove it independent of same-repo tasks.
+    write_paths: list[str] = field(default_factory=list)
+    read_paths: list[str] = field(default_factory=list)
+    shared_resources: list[str] = field(default_factory=list)
     max_retries: int = 2
-    timeout_seconds: int = 900
+    timeout_seconds: int = 1500
     model: str = ""
     purpose: str = ""
     result_note: str = ""
@@ -426,7 +435,8 @@ _ORDER = (
     "id", "title", "status", "priority", "workstream", "repo", "branch",
     "purpose", "prompt_path", "prompt_inline", "session", "session_affinity",
     "parallel_safe", "workspace_budget_mb", "keep_workspace", "requires_approval",
-    "approval_note", "dependencies", "max_retries", "timeout_seconds", "model",
+    "approval_note", "dependencies", "write_paths", "read_paths",
+    "shared_resources", "max_retries", "timeout_seconds", "model",
     "result_note", "risk_tier", "runtime_probe", "source", "spawn_allowed",
 )
 
@@ -471,6 +481,9 @@ def task_to_toml_block(task: Task) -> str:
         if key == "runtime_probe" and not value:
             continue
         if key == "dependencies" and not value:
+            continue
+        # Scheduling surface fields: present only when the owner declared them.
+        if key in ("write_paths", "read_paths", "shared_resources") and not value:
             continue
         # Provenance / allow-rule fields stay out of blocks that do not use
         # them (backward-compatible, tight diffs).
