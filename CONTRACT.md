@@ -257,3 +257,30 @@ DISPATCHER_MAX_IDLE_RECOVERIES (2).
 The outcome evidence records continuation count and the last observed
 message_count, so a later reviewer can distinguish active progress,
 watchdog continuation, terminal completion and hard-ceiling timeout.
+
+### Manifest producer and fail-closed admission
+
+The Dispatcher consumes resource manifests; it does not pretend to infer source
+dependencies from task prose. Before a repo task is promoted to READY, the
+Supervisor/intake path must inspect the task prompt and target repo at the
+recorded baseline and populate:
+- write_paths: expected files/modules/config/schema/API surfaces the task may
+  modify;
+- read_paths: files/modules/contracts whose current behavior the task depends
+  on;
+- shared_resources: mutable cross-repository resources (DB tables, runtime,
+  deployment target, shared service/API contract);
+- dependencies: producer/consumer task IDs where one task requires another's
+  output.
+
+The manifest must include evidence paths/SHAs and confidence. If the Supervisor
+cannot establish a bounded write/read set, it must leave the task unscoped;
+the Dispatcher will not claim that two same-repo unscoped tasks are independent.
+A missing or ambiguous manifest is serialized/blocked, never guessed PARALLEL.
+
+The topological admission pass blocks every member of a producer/consumer
+cycle (including cycles longer than two tasks). If a durable resource lock
+races after admission, partial locks are rolled back and the task returns to
+READY without invoking its worker. If the decision ledger cannot be written,
+the decision fails closed as BLOCKED. Remote branch HEAD must be freshly
+verified; a failed fetch cannot reuse a stale remote-tracking ref.

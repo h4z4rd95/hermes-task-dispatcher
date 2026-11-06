@@ -202,6 +202,11 @@ def env(tmp_path, monkeypatch):
     (control / "hermes").mkdir(parents=True)
     cfg = _make_config(tmp_path, control)
     monkeypatch.setattr("dispatcher.config.config", lambda: cfg)
+    from dispatcher.scheduling import SchedulingAdmitter
+    monkeypatch.setattr(
+        SchedulingAdmitter, "refresh_remote_head",
+        lambda self, task, state, control=None: ("a" * 40) if task.repo else None,
+    )
     store = StateStore(cfg.state_db)
     router = FakeRouter()
     workspace = FakeWorkspace()

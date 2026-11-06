@@ -79,7 +79,7 @@ H2 = "b" * 40
 def _script_head(monkeypatch, heads: dict[str, str]) -> None:
     """Replace the remote-HEAD probe with a deterministic per-task value."""
     def fake(self, task, state, control=None):
-        return heads.get(task.id)
+        return heads.get(task.id, H1)
     monkeypatch.setattr(SchedulingAdmitter, "refresh_remote_head", fake)
 
 
@@ -566,3 +566,89 @@ def test_tick_circular_pair_blocked(env, monkeypatch):
     rows_a = _decision_rows(store, "T-A")
     assert rows_a and rows_a[-1]["decision"] == BLOCKED
     assert "circular" in rows_a[-1]["reasons"]
+
+
+def test_three_task_dependency_cycle_blocks_every_member(tmp_path):
+    a = _task(id="A", title="a", repo=REPO, write_paths=["src/a.py"],
+              read_paths=["src/c.py"])
+    b = _task(id="B", title="b", repo=REPO, write_paths=["src/b.py"],
+              read_paths=["src/a.py"])
+    c = _task(id="C", title="c", repo=REPO, write_paths=["src/c.py"],
+              read_paths=["src/b.py"])
+    manifests = {
+        "A": derive_manifest(a, baseline_sha=H1),
+        "B": derive_manifest(b, baseline_sha=H1),
+        "C": derive_manifest(c, baseline_sha=H1),
+    }
+    ordered, cyclic = order_candidates([a, b, c], manifests)
+    assert {task.id for task in ordered} == {"A", "B", "C"}
+    assert cyclic == {"A", "B", "C"}
+
+
+def test_lock_resources_rolls_back_partial_acquisition(tmp_path):
+    store = StateStore(tmp_path / "d.sqlite")
+    ad = SchedulingAdmitter(store, lambda *a: None)
+    task = _task(id="B", title="b", repo=REPO,
+                 write_paths=["src/a.py", "src/b.py"])
+    # The second resource is already owned by another task. The first may be
+    # acquired before the collision, but all partial locks must be rolled back.
+    store.acquire_resource_lock("OTHER", f"write:{REPO}:src/b.py", 1200)
+    with pytest.raises(RuntimeError, match="held by task 'OTHER'"):
+        ad.lock_resources(task, derive_manifest(task, baseline_sha=H1))
+    rows = _lock_rows(store)
+    assert not any(r["owner_task"] == "B" and r["state"] == "HELD" for r in rows)
+    assert any(r["owner_task"] == "OTHER" and r["state"] == "HELD" for r in rows)
+
+
+def test_decision_ledger_write_failure_fails_closed(tmp_path):
+    class BrokenStore:
+        def record_scheduling_decision(self, _record):
+            raise OSError("simulated ledger write failure")
+
+    ad = SchedulingAdmitter(BrokenStore(), lambda *a: None)
+    task = _task(id="A", title="a", repo=REPO, write_paths=["src/a.py"])
+    decision = ad.admit(
+        task, derive_manifest(task, baseline_sha=H1),
+        states={}, running_manifests={}, admitted={}, inbox=_inbox([task]),
+    )
+    assert decision.decision == BLOCKED
+    assert any("fail closed" in reason for reason in decision.reasons)
+
+
+def test_tick_remote_head_unavailable_blocks_repo_task(env, monkeypatch):
+    d, cfg, store, router, workspace, control, control_dir = env
+    _stub_pass_gate(monkeypatch)
+    _script_head(monkeypatch, {"T-NO-HEAD": None})
+    task = _task(id="T-NO-HEAD", title="cannot verify baseline",
+                 repo=REPO, branch="main", write_paths=["src/new.py"])
+    _write_inbox(control_dir, [task])
+    report = d.tick()
+    assert report.claimed == []
+    assert "T-NO-HEAD" in report.blocked
+    assert not router.calls
+    state = store.get("T-NO-HEAD")
+    assert state is not None
+    assert state.status == "READY"
+    assert "remote HEAD" in state.last_skip_reason
+
+
+def test_tick_lock_failure_defers_without_running_worker(env, monkeypatch):
+    from dispatcher.scheduling import SchedulingAdmitter
+
+    d, cfg, store, router, workspace, control, control_dir = env
+    _stub_pass_gate(monkeypatch)
+    _script_head(monkeypatch, {"T-LOCK-RACE": H1})
+    task = _task(id="T-LOCK-RACE", title="lock race",
+                 repo=REPO, branch="main", write_paths=["src/new.py"])
+    _write_inbox(control_dir, [task])
+    monkeypatch.setattr(
+        SchedulingAdmitter, "lock_resources",
+        lambda self, task, manifest: (_ for _ in ()).throw(RuntimeError("held by peer")),
+    )
+    report = d.tick()
+    assert report.claimed == []
+    assert "T-LOCK-RACE" in report.skipped
+    assert not router.calls
+    state = store.get("T-LOCK-RACE")
+    assert state is not None
+    assert state.status == "READY"

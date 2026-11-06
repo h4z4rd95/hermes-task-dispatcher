@@ -38,8 +38,10 @@ inside the existing claim loop, one tick at a time.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 import time
@@ -299,6 +301,28 @@ class SchedulingDecision:
 # --- admitter ----------------------------------------------------------------------
 
 
+def _github_git_env() -> dict[str, str]:
+    """Pass an existing GitHub token to git through environment config only.
+
+    The credential never appears in argv, URL, file, or logs. Public repositories
+    continue to work without a token; private repositories can resolve HEAD when
+    the dispatcher inherited its normal GITHUB_TOKEN/GH_TOKEN environment.
+    """
+    env = dict(os.environ)
+    token = env.get("GITHUB_TOKEN") or env.get("GH_TOKEN")
+    if not token:
+        return env
+    try:
+        count = max(0, int(env.get("GIT_CONFIG_COUNT", "0") or 0))
+    except ValueError:
+        count = 0
+    encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+    env[f"GIT_CONFIG_KEY_{count}"] = "http.https://github.com/.extraheader"
+    env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {encoded}"
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    return env
+
+
 class SchedulingAdmitter:
     """Conflicts-aware admission inside the existing claim loop.
 
@@ -373,14 +397,17 @@ class SchedulingAdmitter:
         ws = Path(state.workspace_path) if state is not None and state.workspace_path else None
         if ws is not None and ws.is_dir():
             try:
-                subprocess.run(["git", "-C", str(ws), "fetch", "--quiet", "origin", branch],
-                               capture_output=True, text=True, timeout=60, check=False)
-                proc = subprocess.run(
-                    ["git", "-C", str(ws), "rev-parse", "--verify",
-                     f"refs/remotes/origin/{branch}"],
-                    capture_output=True, text=True, timeout=30, check=False)
-                if proc.returncode == 0 and len(proc.stdout.strip()) == 40:
-                    return proc.stdout.strip()
+                fetched = subprocess.run(
+                    ["git", "-C", str(ws), "fetch", "--quiet", "origin", branch],
+                    capture_output=True, text=True, timeout=60, check=False,
+                    env=_github_git_env())
+                if fetched.returncode == 0:
+                    proc = subprocess.run(
+                        ["git", "-C", str(ws), "rev-parse", "--verify",
+                         f"refs/remotes/origin/{branch}"],
+                        capture_output=True, text=True, timeout=30, check=False)
+                    if proc.returncode == 0 and len(proc.stdout.strip()) == 40:
+                        return proc.stdout.strip()
             except Exception:
                 pass
         if control is not None:
@@ -403,7 +430,7 @@ class SchedulingAdmitter:
             url = f"https://github.com/{task.repo}.git"
             proc = subprocess.run(["git", "ls-remote", url, branch],
                                   capture_output=True, text=True, timeout=60,
-                                  check=False)
+                                  check=False, env=_github_git_env())
             if proc.returncode == 0:
                 for line in proc.stdout.splitlines():
                     parts = line.split()
@@ -432,19 +459,9 @@ class SchedulingAdmitter:
 
     @staticmethod
     def order_candidates(tasks: list, manifests: dict) -> tuple[list, set]:
-        """Stable topological order: producers admitted before consumers.
-
-        If task i writes a path that task j reads (same repo), i must be
-        admitted before j: a consumer must never start against a file its
-        producer is about to modify this tick. Order is stable otherwise
-        (priority/claim order is preserved). A circular read/write pair can
-        never be ordered and is returned in ``cyclic`` — the caller BLOCKs
-        it, because neither task's independence from the other can be
-        proven.
-        """
+        """Stable topological order; every node in a dependency cycle is blocked."""
         order = list(tasks)
-        n = len(order)
-        if n < 2:
+        if len(order) < 2:
             return order, set()
 
         def produces(producer, consumer) -> bool:
@@ -458,34 +475,33 @@ class SchedulingAdmitter:
             return any(paths_overlap(wa, rb)
                        for wa in mw.write_paths for rb in mr.read_paths)
 
-        cyclic: set[str] = set()
-        changed = True
-        passes = 0
-        while changed and passes <= n + 1:
-            changed = False
-            passes += 1
-            pos = {t.id: i for i, t in enumerate(order)}
-            for i in range(len(order)):
-                for j in range(i + 1, len(order)):
-                    a, b = order[i], order[j]
-                    if a.id in cyclic or b.id in cyclic:
-                        continue
-                    # a currently precedes b. The only actionable case is
-                    # b-first (b must come before a): swap. Both-first is a
-                    # cycle; a-first is already satisfied by this ordering.
-                    a_first = produces(a, b)
-                    b_first = produces(b, a)
-                    if a_first and b_first:
-                        cyclic.add(a.id)
-                        cyclic.add(b.id)
-                        continue
-                    if b_first:
-                        order[i], order[j] = order[j], order[i]
-                        # Positions changed: recompute so this pass never
-                        # swaps on stale indices (would oscillate).
-                        pos = {t.id: k for k, t in enumerate(order)}
-                        changed = True
-        return order, cyclic
+        original_index = {task.id: i for i, task in enumerate(order)}
+        by_id = {task.id: task for task in order}
+        edges: dict[str, set[str]] = {task.id: set() for task in order}
+        indegree: dict[str, int] = {task.id: 0 for task in order}
+        for producer in order:
+            for consumer in order:
+                if produces(producer, consumer) and consumer.id not in edges[producer.id]:
+                    edges[producer.id].add(consumer.id)
+                    indegree[consumer.id] += 1
+
+        ready = sorted(
+            (task_id for task_id, degree in indegree.items() if degree == 0),
+            key=lambda task_id: original_index[task_id],
+        )
+        emitted: list[str] = []
+        while ready:
+            task_id = ready.pop(0)
+            emitted.append(task_id)
+            for consumer_id in sorted(edges[task_id], key=lambda x: original_index[x]):
+                indegree[consumer_id] -= 1
+                if indegree[consumer_id] == 0:
+                    ready.append(consumer_id)
+                    ready.sort(key=lambda x: original_index[x])
+
+        cyclic = set(by_id) - set(emitted)
+        emitted.extend(sorted(cyclic, key=lambda task_id: original_index[task_id]))
+        return [by_id[task_id] for task_id in emitted], cyclic
 
     def admit(
         self,
@@ -637,9 +653,13 @@ class SchedulingAdmitter:
             rec["reeval"] = reeval
         try:
             inserted = self.store.record_scheduling_decision(rec)
-        except Exception as exc:  # persistence must never break a tick
-            self.log("warn", f"scheduling decision persist failed for {task.id}: {exc}")
-            inserted = 0
+        except Exception as exc:
+            self.log("error", f"scheduling decision persist failed for {task.id}: {exc}")
+            d.decision = BLOCKED
+            d.reasons.append(
+                f"scheduling decision could not be durably recorded; fail closed: {type(exc).__name__}"
+            )
+            return d
         if not inserted and not reeval:
             self.log("debug", f"{task.id}: decision unchanged ({decision}); no new ledger row")
         elif reeval:
@@ -671,8 +691,16 @@ class SchedulingAdmitter:
             got, owner = self.store.acquire_resource_lock(
                 task.id, res, lease_seconds=self._lock_lease(task)
             )
-            if got:
-                owned.append(res)
+            if not got:
+                # A concurrent tick may have won the race after admission.
+                # Roll back any partial locks and fail closed; the caller must
+                # return the task to READY without invoking its worker.
+                self.store.release_resource_locks(task.id)
+                raise RuntimeError(
+                    f"resource lock {res!r} is held by task {owner!r}; "
+                    "claim must be deferred and re-evaluated next tick"
+                )
+            owned.append(res)
         return owned
 
     def _lock_lease(self, task: Task) -> int:

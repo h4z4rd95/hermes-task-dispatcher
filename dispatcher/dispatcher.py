@@ -383,7 +383,7 @@ class Dispatcher:
                     self.store.upsert(state_row)
                     states[task.id] = state_row
             manifest = sched.candidate_manifest(task, state_row, head)
-            prep[task.id] = (state_row, reeval, manifest)
+            prep[task.id] = (state_row, reeval, manifest, head)
         ordered, cyclic = sched.order_candidates(
             candidates, {t.id: prep[t.id][2] for t in candidates}
         )
@@ -402,7 +402,16 @@ class Dispatcher:
             if self._workstream_busy(states, inbox, task) and not task.parallel_safe:
                 report.skipped.append(task.id)
                 continue
-            state_row, reeval, manifest = prep[task.id]
+            state_row, reeval, manifest, remote_head = prep[task.id]
+            if task.repo and not remote_head:
+                report.blocked.append(task.id)
+                reason = (
+                    f"cannot verify remote HEAD for {task.repo}@{task.branch or 'main'}; "
+                    "baseline freshness is unknown"
+                )
+                self.store.set_skip_reason(task.id, f"BLOCKED (scheduling): {reason}")
+                sched.record_blocked(task, manifest, reason, reeval=reeval)
+                continue
             if task.id in cyclic:
                 # Circular read/write dependency within this tick's candidates:
                 # neither task's independence from the other can be proven.
@@ -469,7 +478,20 @@ class Dispatcher:
             try:
                 sched.lock_resources(task, manifest)
             except Exception as exc:
-                self.log("warn", f"{task.id}: resource lock acquisition failed: {exc}")
+                reason = f"resource lock acquisition failed; task deferred: {exc}"
+                self.log("warn", f"{task.id}: {reason}")
+                sched.release_resources(task.id)
+                self.store.release(
+                    task.id, status="READY", error=reason,
+                    summary="claim deferred because a resource lock could not be acquired",
+                )
+                report.skipped.append(task.id)
+                states = self.store.all_states()
+                continue
+            # Persist the exact remote baseline before the worker starts.
+            if manifest.baseline_sha and claimed.baseline_sha != manifest.baseline_sha:
+                claimed.baseline_sha = manifest.baseline_sha
+                self.store.upsert(claimed)
             admitted[task.id] = manifest
             report.claimed.append(task.id)
             running += 1
