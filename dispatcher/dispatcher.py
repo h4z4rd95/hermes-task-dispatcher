@@ -214,7 +214,7 @@ class Dispatcher:
             dep_state = states.get(dep_id)
             dep_status = dep_state.status if dep_state else dep_task.status
             if dep_status != "DONE":
-                self.log("debug", f"{task.id}: dependency {dep_id} is {dep_status} — blocked")
+                self._skip(task, state, f"dependency {dep_id} is {dep_status} — not DONE yet")
                 return False
         return True
 
@@ -336,13 +336,59 @@ class Dispatcher:
                     report.recovered.append((task.id, action))
         states = self.store.all_states()
 
+        # 3b. Conflict-aware scheduling (v4): sweep terminal tasks' resource
+        # locks first (idempotent, restart-safe: a tick that died between
+        # release and persistence still converges on the next tick), then
+        # refresh the live write sets of RUNNING tasks from their workspaces
+        # so a write set that grows mid-run blocks conflicting claims
+        # without ever killing the active work.
+        from .scheduling import SchedulingAdmitter, PARALLEL
+
+        sched = SchedulingAdmitter(self.store, self.log)
+        for st in states.values():
+            if st.status in ("DONE", "FAILED", "CANCELLED"):
+                sched.release_resources(st.task_id)
+        running_manifests: dict = {}
+        for task in inbox.tasks:
+            state = states.get(task.id)
+            if state is not None and state.status == "RUNNING":
+                running_manifests[task.id] = sched.refresh_manifest(task, state)
+
         # 4. Claim eligible tasks by priority.
         candidates = sorted(
             (t for t in inbox.tasks if self._eligible(t, inbox, states)),
             key=lambda t: (-t.priority, t.id),
         )
         running = sum(1 for s in states.values() if s.status == "RUNNING")
+        # --- conflict-aware admission prep (v4) ------------------------------
+        # One baseline refresh + manifest per candidate, computed ONCE here
+        # and reused for ordering and the decision below (recomputed every
+        # tick, i.e. immediately before claim and whenever manifests or
+        # baselines change). parallel_safe stays a coarse hint: the decision
+        # is made on actual resource conflicts and overrides it.
+        prep: dict = {}
         for task in candidates:
+            state_row = states.get(task.id)
+            reeval = ""
+            head = sched.refresh_remote_head(task, state_row, self.control)
+            if head and state_row is not None:
+                old = state_row.baseline_sha or ""
+                if old and old != head:
+                    state_row.baseline_sha = head
+                    self.store.upsert(state_row)
+                    states[task.id] = state_row
+                    reeval = f"baseline_refreshed:{old[:12]}->{head[:12]}"
+                elif not old:
+                    state_row.baseline_sha = head
+                    self.store.upsert(state_row)
+                    states[task.id] = state_row
+            manifest = sched.candidate_manifest(task, state_row, head)
+            prep[task.id] = (state_row, reeval, manifest)
+        ordered, cyclic = sched.order_candidates(
+            candidates, {t.id: prep[t.id][2] for t in candidates}
+        )
+        admitted: dict = {}
+        for task in ordered:
             if running >= self.cfg.max_concurrent:
                 self.log("debug", "concurrency limit reached; remaining tasks wait")
                 break
@@ -356,16 +402,75 @@ class Dispatcher:
             if self._workstream_busy(states, inbox, task) and not task.parallel_safe:
                 report.skipped.append(task.id)
                 continue
+            state_row, reeval, manifest = prep[task.id]
+            if task.id in cyclic:
+                # Circular read/write dependency within this tick's candidates:
+                # neither task's independence from the other can be proven.
+                report.blocked.append(task.id)
+                peers = [t.id for t in candidates
+                         if t.id != task.id and t.id in cyclic]
+                self.store.set_skip_reason(
+                    task.id, "BLOCKED (scheduling): circular read/write dependency")
+                try:
+                    sched.record_blocked(
+                        task, manifest,
+                        f"circular read/write dependency with {peers or 'circular set'}; "
+                        f"safe independence cannot be proven",
+                    )
+                except Exception as exc:
+                    self.log("warn", f"{task.id}: cyclic BLOCKED persist failed: {exc}")
+                continue
+            decision = sched.admit(
+                task, manifest, states=states,
+                running_manifests=running_manifests, admitted=admitted,
+                inbox=inbox, reeval=reeval,
+            )
+            if decision.decision == PARALLEL:
+                pass  # fall through to claim below
+            elif decision.decision == "SERIAL_AFTER":
+                report.skipped.append(task.id)
+                self.store.set_skip_reason(
+                    task.id,
+                    f"SERIAL_AFTER {decision.predecessor}: {decision.wait_condition}",
+                )
+                continue
+            elif decision.decision == "SERIAL_LOCK":
+                report.skipped.append(task.id)
+                self.store.set_skip_reason(
+                    task.id,
+                    f"SERIAL_LOCK {decision.resource} (owner {decision.lock_owner})",
+                )
+                continue
+            else:  # BLOCKED — independence cannot be proven
+                report.blocked.append(task.id)
+                self.store.set_skip_reason(
+                    task.id,
+                    f"BLOCKED (scheduling): {decision.reasons[0]}"
+                    if decision.reasons else "BLOCKED (scheduling)",
+                )
+                continue
+            # --- claim (unchanged semantics) ----------------------------------
             claimed = self.store.claim(task.id, lease_seconds=task.timeout_seconds)
             if claimed is None:
                 self.log("debug", f"{task.id}: already claimed by another tick")
                 continue
             # Claiming is an actionable transition — clear any stored skip
-            # reason so a later re-block is logged as a fresh event.
+            # reason so a later re-block is logged as a fresh event. Clear the
+            # in-memory object too: _run_task re-upserts it (workspace binding)
+            # and would otherwise resurrect the stale reason from its snapshot.
             try:
                 self.store.set_skip_reason(task.id, "")
+                claimed.last_skip_reason = ""
             except Exception:
                 pass
+            # Single-writer locks for this task's declared/derived resources:
+            # durable across ticks, released idempotently when the task goes
+            # terminal (sweep in 3b or explicit release on the run path).
+            try:
+                sched.lock_resources(task, manifest)
+            except Exception as exc:
+                self.log("warn", f"{task.id}: resource lock acquisition failed: {exc}")
+            admitted[task.id] = manifest
             report.claimed.append(task.id)
             running += 1
             try:
@@ -376,6 +481,7 @@ class Dispatcher:
                     task.id, status="FAILED", error=f"{type(exc).__name__}: {exc}",
                     summary="task run raised unexpectedly",
                 )
+                sched.release_resources(task.id)
                 report.errors.append(f"{task.id}: {exc}")
             states = self.store.all_states()
 
