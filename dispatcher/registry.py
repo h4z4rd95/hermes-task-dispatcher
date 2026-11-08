@@ -78,13 +78,15 @@ def validate_artifact_branch(value: str) -> str:
         return f"artifact_branch {v!r} must not be a default/main branch"
     if not _ARTIFACT_BRANCH_RE.match(v):
         return f"artifact_branch {v!r} is not a safe branch name"
-    if v.endswith("/") or "//" in v or v.endswith(".lock"):
+    if v.endswith("/") or "//" in v or v.endswith(".lock") or v.endswith(".LOCK"):
         return f"artifact_branch {v!r} is not a safe branch name"
     for comp in v.split("/"):
-        if comp in _FORBIDDEN_BRANCH_COMPONENTS:
+        if comp.lower() in _FORBIDDEN_BRANCH_COMPONENTS:
             return f"artifact_branch {v!r} contains a forbidden component {comp!r}"
-        if comp.startswith("."):
-            return f"artifact_branch {v!r} contains a dot component {comp!r}"
+        if comp.startswith(".") or comp.startswith("-"):
+            return f"artifact_branch {v!r} contains an unsafe component {comp!r}"
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", comp):
+            return f"artifact_branch {v!r} contains an unsafe component {comp!r}"
     return ""
 
 
