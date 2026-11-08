@@ -74,6 +74,17 @@ class FakeCheckout:
         self.path = path
         self.created = True
         self.size_bytes = 0
+        self.remote_url = ""
+        self.remote_main_sha = ""
+
+
+class FakeArtifactCheckout:
+    def __init__(self, path: Path, *, remote_url: str = "", remote_main_sha: str = ""):
+        self.path = path
+        self.created = True
+        self.size_bytes = 0
+        self.remote_url = remote_url or "https://github.com/h4z4rd95/evidence-store.git"
+        self.remote_main_sha = remote_main_sha or "m" * 40
 
 
 class FakeWorkspace:
@@ -88,6 +99,14 @@ class FakeWorkspace:
         path = Path(f"/tmp/fake/{task_id}")
         self.checkouts.append({"task_id": task_id, "repo": repo, "branch": branch})
         return FakeCheckout(path)
+
+    def checkout_artifact(self, *, task_id, store, branch, purpose="", keep=False,
+                          task_budget_mb=0, depth=1, remote_url=None) -> FakeArtifactCheckout:
+        path = Path(f"/tmp/fake-art/{task_id}")
+        path.mkdir(parents=True, exist_ok=True)
+        self.checkouts.append({"task_id": task_id, "store": store,
+                               "branch": branch, "kind": "artifact"})
+        return FakeArtifactCheckout(path)
 
     def bind_session(self, path: Path, session_id: str) -> None:
         self.bound.append((path, session_id))
@@ -257,7 +276,8 @@ def test_pending_task_is_valid_but_not_claimed(env):
     assert store.get("T-PENDING").status == "PENDING"
 
 
-def test_owner_promotion_from_pending_to_ready_syncs_sqlite_and_claims(env):
+def test_owner_promotion_from_pending_to_ready_syncs_sqlite_and_claims(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-PROMOTE", title="Owner promoted",
                                 prompt_inline="Reply PONG", status="PENDING")])
@@ -284,32 +304,38 @@ def test_ready_inbox_does_not_auto_rearm_terminal_sqlite_state(env):
     assert router.calls == []
 
 
-def test_ready_task_is_claimed_and_completes(env):
+def test_ready_prompt_only_task_is_claimed_and_not_falsely_done(env):
+    """Issue #99 contract: a prompt-only legacy task (no repo, no artifact
+    metadata) keeps the home-directory workdir, but its gate stays PARTIAL
+    (non-accepted) — it is claimed and its outcome published, never
+    falsely DONE."""
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-1", title="Smoke", prompt_inline="Reply PONG",
                                 session="smoke-1")])
     report = d.tick()
     assert report.claimed == ["T-1"]
-    assert "T-1" in report.completed
-    assert store.get("T-1").status == "DONE"
+    assert "T-1" not in report.completed
+    assert store.get("T-1").status == "FAILED"
     assert router.calls[0]["session_name"] == "smoke-1"
     assert control_repo.pushed == 1
+    # Historical behaviour: the legacy task ran in the home directory.
+    assert router.workdir == cfg.home
 
 
-def test_probeless_task_reaches_done(env):
+def test_probeless_task_runs_gate_without_probe_error(env):
     """Critical path, regression: a plain task whose registry default
-    ``runtime_probe = {}`` (undeclared) must complete and reach DONE.
-
-    Before the fix, build_probe({}) raised "handler is required" and the
-    tick died on every probe-less task completion.
+    ``runtime_probe = {}`` (undeclared) must run its gate without a probe
+    error. (Issue #99: a prompt-only task's gate then stays PARTIAL /
+    non-accepted — it fails closed instead of falsely passing.)
     """
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-PLAIN", title="Smoke", prompt_inline="Reply PONG",
                                 session="plain-1")])
     report = d.tick()
     assert report.claimed == ["T-PLAIN"]
-    assert "T-PLAIN" in report.completed
-    assert store.get("T-PLAIN").status == "DONE"
+    assert "T-PLAIN" not in report.completed
+    assert store.get("T-PLAIN").status == "FAILED"
+    assert not any("handler is required" in e for e in report.errors)
 
 
 def test_terminal_task_is_not_reclaimed(env):
@@ -322,10 +348,11 @@ def test_terminal_task_is_not_reclaimed(env):
     assert router.calls == [] or len(router.calls) == 1
 
 
-def test_resume_run_publishes_its_own_outcome_with_new_run_id(env):
+def test_resume_run_publishes_its_own_outcome_with_new_run_id(env, monkeypatch):
     """Issue #43: a task that FAILED, was re-armed (inbox row + state row) and
     completed on its second run must publish a second ledger write carrying a
     fresh run identity — not be swallowed by the old (task, status) dedup."""
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control_repo, control = env
     router.runs = [FakeRun(exit_code=1, stdout="first run failed"),
                    FakeRun(exit_code=0, stdout="second run ok")]
@@ -370,7 +397,8 @@ def test_dependency_blocks_dependent_task(env):
     assert "T-1" in report.claimed
 
 
-def test_dependency_done_unblocks_dependent(env):
+def test_dependency_done_unblocks_dependent(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [
         Task(id="T-1", title="Base", prompt_inline="p"),
@@ -410,7 +438,8 @@ def test_nonzero_exit_marks_failed(env):
     assert store.get("T-1").status == "FAILED"
 
 
-def test_concurrency_limit_respected(env):
+def test_concurrency_limit_respected(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control_repo, control = env
     # Config is frozen; rebuild it with a lower concurrency limit.
     from dispatcher.config import Config as _C
@@ -557,7 +586,8 @@ def test_keep_workspace_not_released(env):
     assert workspace.released == []
 
 
-def test_outcome_spooled_and_idempotent(env):
+def test_outcome_spooled_and_idempotent(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control_repo, control = env
     _write_inbox(control, [Task(id="T-1", title="x", prompt_inline="p")])
     d.tick()
@@ -808,7 +838,8 @@ def test_worker_env_depth_increments_when_nested(env, monkeypatch):
     assert router.extra_env["DISPATCHER_TASK_ID"] == "T-49"
 
 
-def test_outcome_carries_task_source(env):
+def test_outcome_carries_task_source(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     """Every automated run is linkable to its source: the ledger write
     carries the task's provenance (github-issue-<n> / spawned-by:<task>)."""
     d, cfg, store, router, workspace, control_repo, control = env
@@ -862,7 +893,8 @@ def test_commit_sha_is_persisted_before_push(env, monkeypatch, tmp_path):
     assert store.get(task.id).commit_sha == "commit-sha-before-push"
 
 
-def test_recovered_commit_sha_is_in_spooled_outcome(env):
+def test_recovered_commit_sha_is_in_spooled_outcome(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     import json
 
     d, cfg, store, router, workspace, control_repo, control = env
@@ -904,3 +936,133 @@ def test_commit_push_failure_requeues_same_workspace(env, monkeypatch):
     assert report.completed == []
     assert report.recovered == [(task.id, "commit/push failed; same task/session/workspace queued for retry")]
     assert workspace.kept == [Path(f"/tmp/fake/{task.id}")]
+
+
+def test_nonrepo_artifact_dispatch_requires_independent_fetchback(tmp_path):
+    """Issue #99: dispatch a non-repository task through a local bare remote."""
+    import hashlib
+    import json
+    import logging
+    import subprocess
+
+    from dispatcher.workspace import WorkspaceManager
+
+    def git(cwd: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    class PublishingRouter(FakeRouter):
+        def run(self, *, session_name, prompt, model=None, max_turns=None,
+                run_budget_s=None):
+            assert self.workdir is not None
+            self.calls.append({"session_name": session_name, "prompt": prompt})
+            branch = git(self.workdir, "branch", "--show-current")
+            target = self.workdir / "evidence" / "artifact-e2e-report.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                "# Artifact E2E\n\nVerified local bare-remote dispatch.\n",
+                encoding="utf-8",
+            )
+            git(self.workdir, "config", "user.name", "Dispatcher E2E")
+            git(self.workdir, "config", "user.email", "dispatcher-e2e@example.invalid")
+            git(self.workdir, "add", "evidence/artifact-e2e-report.md")
+            git(self.workdir, "commit", "-m", "test: publish artifact E2E report")
+            git(self.workdir, "push", "--set-upstream", "origin", branch)
+            return FakeRun(
+                session_id="artifact-e2e-session",
+                stdout="artifact committed and pushed",
+            )
+
+    control = tmp_path / "control"
+    (control / "hermes").mkdir(parents=True)
+    cfg = _make_config(tmp_path, control)
+
+    # Create a disposable bare store with an immutable main baseline.
+    bare = tmp_path / "evidence-store.git"
+    seed = tmp_path / "seed"
+    bare.mkdir()
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    seed.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=seed, check=True, capture_output=True)
+    git(seed, "config", "user.name", "Dispatcher E2E")
+    git(seed, "config", "user.email", "dispatcher-e2e@example.invalid")
+    (seed / "README.md").write_text("Disposable artifact store.\n", encoding="utf-8")
+    git(seed, "add", "README.md")
+    git(seed, "commit", "-m", "test: initialize artifact store")
+    git(seed, "remote", "add", "origin", bare.as_uri())
+    git(seed, "push", "-u", "origin", "main")
+    main_before = subprocess.run(
+        ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    artifact_store = "h4z4rd95/evidence-store"
+    workspace = WorkspaceManager(
+        cfg.workspace_pool,
+        global_quota_mb=cfg.global_workspace_quota_mb,
+        github_token="",
+        logger=logging.getLogger("artifact-e2e"),
+        remote_urls={artifact_store: bare.as_uri()},
+    )
+    # The local bare remote has no GitHub API size endpoint; use a deterministic
+    # measured size while retaining the actual checkout and quota flow.
+    workspace._check_quota = lambda **kwargs: 1024
+
+    task = Task(
+        id="T-ARTIFACT-E2E",
+        title="Publish a durable non-repository report",
+        status="READY",
+        repo="",
+        prompt_inline="Create the declared report and push it to the assigned branch.",
+        task_class="DOCUMENTATION",
+        project="dispatcher-e2e",
+        artifact_store=artifact_store,
+        artifact_branch="work/artifact-e2e",
+        deliverable="evidence/artifact-e2e-report.md",
+        keep_workspace=True,
+        risk_tier="T1",
+    )
+    _write_inbox(control, [task])
+
+    state = StateStore(cfg.state_db)
+    router = PublishingRouter()
+    control_repo = FakeControl()
+    dispatcher = Dispatcher(
+        cfg, store=state, router=router, workspace=workspace, control=control_repo
+    )
+    report = dispatcher.tick()
+
+    assert report.claimed == [task.id]
+    assert report.completed == [task.id]
+    assert state.get(task.id).status == "DONE"
+    assert len(router.calls) == 1
+    assert "Do not create, push to, or modify the store's main/master branch" in router.calls[0]["prompt"]
+
+    gate = json.loads(
+        (cfg.state_dir / f"verification-{task.id}.json").read_text(encoding="utf-8")
+    )
+    artifact = gate["artifact"]
+    assert gate["status"] == "PASS"
+    assert artifact["independent_remote_read"] is True
+    assert artifact["remote_sha"] == artifact["fetched_head"] == artifact["local_sha"]
+    assert artifact["deliverable_sha256"] == artifact["remote_deliverable_sha256"]
+
+    remote_branch = subprocess.run(
+        ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/work/artifact-e2e"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    main_after = subprocess.run(
+        ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert remote_branch == artifact["remote_sha"]
+    assert main_after == main_before
+
+    deliverable = Path(state.get(task.id).workspace_path) / task.deliverable
+    assert hashlib.sha256(deliverable.read_bytes()).hexdigest() == artifact["deliverable_sha256"]
+    artifact_evidence = next(
+        x for x in control_repo.written[0]["evidence"] if x.get("kind") == "artifact"
+    )
+    assert artifact_evidence["commit_sha"] == remote_branch
+    assert artifact_evidence["gate"] == "PASS"

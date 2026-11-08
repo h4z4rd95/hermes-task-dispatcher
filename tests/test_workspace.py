@@ -44,7 +44,14 @@ class CompletedStub:
 
 
 class FakeGit:
-    """Records git invocations and materialises a fake checkout on clone/sync."""
+    """Records git invocations and materialises a fake checkout on clone/sync.
+
+    Installs both the ``_git`` and ``_git_rc`` seams. The fake store treats
+    the declared branch as *published* (``rev-parse --verify`` on
+    ``refs/remotes/origin/<branch>`` succeeds), which is what
+    :meth:`WorkspaceManager._sync` probes before it may refresh a clean
+    checkout.
+    """
 
     def __init__(self, fail_on=(), *, dirty=False, ahead=0, behind=1):
         self.calls: list[tuple[tuple[str, ...], str]] = []
@@ -57,8 +64,7 @@ class FakeGit:
     def install(self, manager: WorkspaceManager) -> WorkspaceManager:
         self_manager = self
 
-        def _git(args, *, cwd):
-            self_manager.calls.append((tuple(args), str(cwd)))
+        def _materialize(args, cwd):
             joined = " ".join(args)
             for token in self_manager.fail_on:
                 if token in joined:
@@ -78,13 +84,23 @@ class FakeGit:
                 (Path(cwd) / "README.md").write_text(
                     f"# {REPO}@{BRANCH} (reset)\n"
                 )
-            elif args[0] == "status":
+
+        def _git(args, *, cwd):
+            self_manager.calls.append((tuple(args), str(cwd)))
+            _materialize(args, str(cwd))
+            if args[0] == "status":
                 return CompletedStub(" M partial.py\n" if self_manager.dirty else "")
-            elif args[0] == "rev-list":
+            if args[0] == "rev-list":
                 return CompletedStub(f"{self_manager.ahead}\t{self_manager.behind}\n")
             return CompletedStub()
 
+        def _git_rc(args, *, cwd):
+            self_manager.calls.append((tuple(args), str(cwd)))
+            _materialize(args, str(cwd))
+            return 0, "", ""
+
         manager._git = _git  # type: ignore[method-assign]
+        manager._git_rc = _git_rc  # type: ignore[method-assign]
         manager._fake_git = self  # type: ignore[attr-defined]
         return manager
 
