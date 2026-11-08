@@ -705,3 +705,39 @@ def test_session_progress_reads_message_count_and_terminal_state(tmp_path):
     assert progress.message_count == 17
     assert progress.last_activity_at == 1234.5
     assert progress.ended_at is None
+
+
+# --- Issue #99: workdir pinning across fresh/resumed/idle-recovery runs ------
+
+
+def test_workdir_persists_across_fresh_and_resumed_runs():
+    """The dispatcher pins router.workdir per task and re-pins it on session
+    resume and idle recovery. Every run — fresh or resumed — must execute in
+    that same declared workspace directory (child cwd and --in flag), never
+    drifting to the caller's cwd."""
+    workdir = Path("/ws/artifact-T-1")
+
+    fresh = FakeRunner(stdout=FRESH_STDOUT, session_exists=False)
+    router = make_router(fresh)
+    router.workdir = workdir
+    r1 = router.run(session_name="art-1", prompt="fresh run")
+    assert r1.exit_code == 0
+    calls = [c for c in fresh.calls if c["cmd"][1] == "chat"]
+    assert len(calls) == 1
+    assert calls[0]["cwd"] == workdir
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--in") + 1] == str(workdir)
+
+    # Idle recovery / continuation: same router instance, re-pinned workdir,
+    # the session now exists so the run resumes it.
+    resumed = FakeRunner(stdout=RESUME_STDOUT, session_exists=True)
+    router._set_runner(resumed)
+    router.workdir = workdir  # dispatcher re-pins before the resumed run
+    r2 = router.run(session_name="art-1", prompt="resume run")
+    assert r2.exit_code == 0
+    assert r2.resumed is True
+    calls = [c for c in resumed.calls if c["cmd"][1] == "chat"]
+    assert len(calls) == 1
+    assert calls[0]["cwd"] == workdir
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--in") + 1] == str(workdir)
