@@ -35,6 +35,7 @@ class TickReport:
     completed: list[str] = field(default_factory=list)
     blocked: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    duplicates: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     commit_sha: str = ""
     pushed: bool = False
@@ -458,8 +459,52 @@ class Dispatcher:
                     if decision.reasons else "BLOCKED (scheduling)",
                 )
                 continue
+            # --- duplicate execution guard (in-flight state) -------------------
+            # Read-only detection is allowed; duplicate execution/recovery is not.
+            try:
+                existing = self.store.find_active_duplicate(
+                    task.id, source=getattr(task, "source", "")
+                )
+            except Exception:
+                existing = None
+            if existing is not None and existing.task_id != task.id:
+                report.skipped.append(task.id)
+                report.duplicates.append({
+                    "task_id": task.id,
+                    "existing_task_id": existing.task_id,
+                    "run_id": existing.run_id,
+                    "source": getattr(task, "source", ""),
+                })
+                self.log("info", f"{task.id}: duplicate of active run "
+                                 f"{existing.task_id} (run {existing.run_id}); suppressed")
+                try:
+                    self.store.set_skip_reason(
+                        task.id,
+                        f"DUPLICATE_ACTIVE {existing.task_id} (run {existing.run_id})",
+                    )
+                except Exception:
+                    pass
+                continue
+            # Same task id already active (CLAIMED/RUNNING): suppress.
+            try:
+                same = self.store.get(task.id)
+            except Exception:
+                same = None
+            if same is not None and same.task_id == task.id and same.status in ("CLAIMED", "RUNNING") and getattr(same, "run_id", ""):
+                # Only suppress if it is not the row we are about to claim (still READY? no).
+                report.skipped.append(task.id)
+                report.duplicates.append({
+                    "task_id": task.id,
+                    "existing_task_id": same.task_id,
+                    "run_id": same.run_id,
+                    "source": getattr(task, "source", ""),
+                })
+                self.log("info", f"{task.id}: already active (run {same.run_id}); suppressed")
+                continue
+
             # --- claim (unchanged semantics) ----------------------------------
-            claimed = self.store.claim(task.id, lease_seconds=task.timeout_seconds)
+            claimed = self.store.claim(task.id, lease_seconds=task.timeout_seconds,
+                                     source=getattr(task, "source", ""))
             if claimed is None:
                 self.log("debug", f"{task.id}: already claimed by another tick")
                 continue
@@ -530,6 +575,23 @@ class Dispatcher:
             # failure instead of a silently stale control repo).
             report.push_failed = True
         return report
+
+    def in_flight_status(self, **kwargs):
+        from .registry import load_inbox
+        try:
+            inbox = load_inbox(self.cfg.inbox_path)
+        except Exception:
+            inbox = None
+        kwargs.setdefault("inbox", inbox)
+        kwargs.setdefault("stale_after_seconds", self.cfg.stale_lease_seconds)
+        return self.store.inflight_status(**kwargs)
+
+    def active_status(self, **kwargs):
+        return self.in_flight_status(**kwargs)
+
+    def find_active_duplicate(self, task_id, source=None, source_issue=None):
+        return self.store.find_active_duplicate(task_id, source=source,
+                                               source_issue=source_issue)
 
     # --- state seeding --------------------------------------------------------
 

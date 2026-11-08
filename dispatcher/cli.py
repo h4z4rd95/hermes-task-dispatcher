@@ -53,7 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     worker = sub.add_parser("worker", help="execute one task (detached worker)")
     worker.add_argument("task_id")
 
-    sub.add_parser("status", help="show task state")
+    stp = sub.add_parser("status", help="show task state")
+    stp.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    stp.add_argument("--human", action="store_true", help="concise human-readable output")
     sub.add_parser("pause", help="create the kill-switch file")
     sub.add_parser("resume", help="remove the kill-switch file")
 
@@ -70,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "worker":
         return _cmd_worker(args.task_id)
     if args.command == "status":
-        return _cmd_status()
+        return _cmd_status(args)
     if args.command == "pause":
         return _cmd_pause()
     if args.command == "resume":
@@ -157,10 +159,19 @@ def _cmd_worker(task_id: str) -> int:
 # --- status -----------------------------------------------------------------
 
 
-def _cmd_status() -> int:
+def _cmd_status(args=None) -> int:
     cfg = config()
     from .registry import load_inbox
     from .state import StateStore
+
+    json_mode = True
+    human_mode = False
+    if args is not None:
+        json_mode = not getattr(args, "human", False)
+        human_mode = bool(getattr(args, "human", False))
+        if getattr(args, "json", False):
+            json_mode = True
+            human_mode = False
 
     try:
         inbox = load_inbox(cfg.inbox_path)
@@ -168,23 +179,49 @@ def _cmd_status() -> int:
         _log("error", f"inbox: {exc}")
         return 3
     store = StateStore(cfg.state_db)
+    snap = store.inflight_status(inbox=inbox,
+                                 stale_after_seconds=cfg.stale_lease_seconds)
+    # Enrich with title/workstream/priority/inbox status for compatibility.
     states = store.all_states()
-    rows = []
-    for task in inbox.tasks:
-        state = states.get(task.id)
-        rows.append(
-            {
-                "id": task.id,
-                "title": task.title,
-                "inbox_status": task.status,
-                "state": state.status if state else "READY",
-                "attempts": state.attempts if state else 0,
-                "session": state.session_id if state else "",
-                "workstream": task.workstream,
-                "priority": task.priority,
-            }
-        )
-    print(json.dumps({"paused": cfg.pause_file.exists(), "tasks": rows}, indent=2))
+    for p in snap.get("tasks", []):
+        tid = p.get("task_id")
+        task = inbox.by_id().get(tid) if tid else None
+        if task is not None:
+            p["title"] = task.title
+            p["inbox_status"] = task.status
+            p["workstream"] = task.workstream
+            p["priority"] = task.priority
+            if not p.get("branch"):
+                p["branch"] = task.branch
+            if not p.get("source") and getattr(task, "source", ""):
+                p["source"] = task.source
+                p["source_issue"] = task.source
+    snap["paused"] = cfg.pause_file.exists()
+
+    if human_mode:
+        active = snap.get("active", [])
+        print(f"Dispatcher status: {len(snap.get('tasks', []))} tasks, "
+              f"{len(active)} active, paused={snap['paused']}")
+        if not active:
+            print("idle: no active (CLAIMED/RUNNING) task")
+        for p in active:
+            print(
+                f"ACTIVE task={p.get('task_id')} source={p.get('source_issue') or p.get('source') or ''} "
+                f"state={p.get('lifecycle_state')} run={p.get('run_id') or ''} "
+                f"heartbeat={p.get('heartbeat_freshness')} session={p.get('session_id') or ''} "
+                f"workspace={p.get('workspace_path') or ''} branch={p.get('branch') or ''} "
+                f"started_at={p.get('started_at')}"
+            )
+        for p in snap.get("tasks", []):
+            if p.get("active"):
+                continue
+            print(
+                f"  {p.get('task_id')}: state={p.get('lifecycle_state')} "
+                f"heartbeat={p.get('heartbeat_freshness')} source={p.get('source_issue') or p.get('source') or ''}"
+            )
+        return 0
+
+    print(json.dumps(snap, indent=2, default=str))
     return 0
 
 

@@ -31,6 +31,9 @@ __all__ = [
 
 TERMINAL = {"DONE", "FAILED", "CANCELLED"}
 RUNNABLE = {"READY"}
+# Lifecycle states that count as an in-flight execution for duplicate guards.
+ACTIVE_EXECUTION_STATES = {"CLAIMED", "RUNNING"}
+INFLIGHT_STATES = ACTIVE_EXECUTION_STATES
 
 
 def _now() -> float:
@@ -117,6 +120,134 @@ def normalize_status(status: str) -> str:
     return status
 
 
+def heartbeat_freshness(state: Any, *, stale_after_seconds: int = 0,
+                       now: float | None = None) -> str:
+    """Classify a task state's heartbeat as fresh/stale/unknown.
+
+    Unknown is never reported as idle: a row with no lease fingerprint (an
+    owner hold) or no expiry keeps "unknown" so callers cannot mistake it
+    for a free slot.
+    """
+    if state is None:
+        return "unknown"
+    if now is None:
+        now = _now()
+    status = normalize_status(getattr(state, "status", "") or "")
+    if status not in ACTIVE_EXECUTION_STATES and status not in ("READY",):
+        # Only active execution rows carry a meaningful heartbeat; everything
+        # else is unknown rather than silently idle.
+        pass
+    pid = getattr(state, "lease_pid", None)
+    start = getattr(state, "lease_start", None)
+    expiry = getattr(state, "lease_expiry", None)
+    # Owner holds (no fingerprint) are unknown, never stale/idle.
+    if pid is None and start is None:
+        return "unknown"
+    if expiry is None:
+        return "unknown"
+    try:
+        if now > float(expiry) + max(int(stale_after_seconds or 0), 0):
+            return "stale"
+    except (TypeError, ValueError):
+        return "unknown"
+    try:
+        if not pid_alive(int(pid or 0), start):
+            return "stale"
+    except (TypeError, ValueError):
+        return "unknown"
+    return "fresh"
+
+
+def is_active_state(state: Any) -> bool:
+    if state is None:
+        return False
+    return normalize_status(getattr(state, "status", "") or "") in ACTIVE_EXECUTION_STATES
+
+
+def inflight_status_dict(state: Any, *, task: Any = None,
+                        stale_after_seconds: int = 0,
+                        now: float | None = None) -> dict[str, Any]:
+    """Serialize one task state into the canonical in-flight status dict."""
+    if now is None:
+        now = _now()
+    status = normalize_status(getattr(state, "status", "") or "") if state is not None else ""
+    if state is None:
+        state_obj = None
+    else:
+        state_obj = state
+    lease_pid = getattr(state_obj, "lease_pid", None) if state_obj is not None else None
+    lease_start = getattr(state_obj, "lease_start", None) if state_obj is not None else None
+    lease_expiry = getattr(state_obj, "lease_expiry", None) if state_obj is not None else None
+    run_id = getattr(state_obj, "run_id", "") if state_obj is not None else ""
+    session_id = getattr(state_obj, "session_id", "") if state_obj is not None else ""
+    workspace_path = getattr(state_obj, "workspace_path", "") if state_obj is not None else ""
+    source = getattr(state_obj, "source", "") if state_obj is not None else ""
+    source_issue = getattr(state_obj, "source_issue", "") if state_obj is not None else ""
+    if not source_issue:
+        source_issue = source
+    if not source:
+        source = source_issue
+    updated_at = getattr(state_obj, "updated_at", None) if state_obj is not None else None
+    branch = ""
+    if task is not None:
+        branch = getattr(task, "branch", "") or ""
+        if not source:
+            source = getattr(task, "source", "") or ""
+        if not source_issue:
+            source_issue = getattr(task, "source", "") or ""
+    freshness = heartbeat_freshness(state_obj, stale_after_seconds=stale_after_seconds, now=now)
+    lifecycle = status if status else "PENDING"
+    started_at = lease_start
+    last_heartbeat = updated_at if updated_at is not None else lease_start
+    payload = {
+        "task_id": getattr(state_obj, "task_id", None) if state_obj is not None else (getattr(task, "id", None) if task is not None else None),
+        "source": source,
+        "source_issue": source_issue,
+        "lifecycle_state": lifecycle,
+        "status": lifecycle,
+        "state": lifecycle,
+        "run_id": run_id,
+        "tick_run_id": run_id,
+        "started_at": started_at,
+        "started_at_epoch": started_at,
+        "last_heartbeat": last_heartbeat,
+        "last_heartbeat_at": last_heartbeat,
+        "last_heartbeat_epoch": last_heartbeat,
+        "heartbeat": last_heartbeat,
+        "heartbeat_at": last_heartbeat,
+        "lease_start": lease_start,
+        "lease_expiry": lease_expiry,
+        "heartbeat_freshness": freshness,
+        "freshness": freshness,
+        "heartbeat_status": freshness,
+        "executor": lease_pid,
+        "executor_pid": lease_pid,
+        "lease_pid": lease_pid,
+        "session": session_id,
+        "session_id": session_id,
+        "executor_session": session_id,
+        "workspace": workspace_path,
+        "workspace_path": workspace_path,
+        "branch": branch,
+        "active": is_active_state(state_obj),
+        "idle": not is_active_state(state_obj),
+    }
+    # ISO-ish convenience (epoch only, no tz conversion beyond utc).
+    try:
+        import datetime as _dt
+        if started_at is not None:
+            payload["started_at_iso"] = _dt.datetime.utcfromtimestamp(float(started_at)).isoformat() + "Z"
+    except Exception:
+        payload["started_at_iso"] = None
+    try:
+        import datetime as _dt
+        if last_heartbeat is not None:
+            payload["last_heartbeat_iso"] = _dt.datetime.utcfromtimestamp(float(last_heartbeat)).isoformat() + "Z"
+    except Exception:
+        payload["last_heartbeat_iso"] = None
+    return payload
+
+
 @dataclass
 class TaskState:
     task_id: str
@@ -145,7 +276,21 @@ class TaskState:
     # manifest was last evaluated against. Refreshed from the remote before
     # claim (SERIAL_AFTER re-evaluation); empty until first refresh.
     baseline_sha: str = ""
+    # Provenance of the task's source issue (registry Task.source), carried
+    # into the state row so duplicate execution can be detected by source
+    # issue even when task identities differ (Issue inflight-state-guard).
+    source: str = ""
+    source_issue: str = ""
     updated_at: float = _now()
+
+    def heartbeat_freshness(self, stale_after_seconds: int = 0, now: float | None = None) -> str:
+        return heartbeat_freshness(self, stale_after_seconds=stale_after_seconds, now=now)
+
+    def is_active(self) -> bool:
+        return is_active_state(self)
+
+    def to_status_dict(self, *args, **kwargs):
+        return inflight_status_dict(self, *args, **kwargs)
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -164,6 +309,8 @@ class TaskState:
             "commit_sha": self.commit_sha,
             "last_skip_reason": self.last_skip_reason,
             "baseline_sha": self.baseline_sha,
+            "source": self.source,
+            "source_issue": self.source_issue or self.source,
             "updated_at": self.updated_at,
         }
 
@@ -185,8 +332,18 @@ class TaskState:
             commit_sha=row["commit_sha"] or "",
             last_skip_reason=row["last_skip_reason"] if "last_skip_reason" in row.keys() else "",
             baseline_sha=row["baseline_sha"] if "baseline_sha" in row.keys() else "",
+            source=row["source"] if "source" in row.keys() else "",
+            source_issue=(row["source_issue"] if "source_issue" in row.keys() else (row["source"] if "source" in row.keys() else "")),
             updated_at=row["updated_at"],
         )
+
+
+    def __post_init__(self) -> None:
+        # Keep the two provenance aliases in sync so callers can use either.
+        if self.source_issue and not self.source:
+            self.source = self.source_issue
+        if self.source and not self.source_issue:
+            self.source_issue = self.source
 
 
 _SCHEMA = """
@@ -206,6 +363,8 @@ CREATE TABLE IF NOT EXISTS task_state (
     commit_sha      TEXT NOT NULL DEFAULT '',
     last_skip_reason TEXT NOT NULL DEFAULT '',
     baseline_sha    TEXT NOT NULL DEFAULT '',
+    source          TEXT NOT NULL DEFAULT '',
+    source_issue    TEXT NOT NULL DEFAULT '',
     updated_at      REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS scheduling_decisions (
@@ -300,11 +459,165 @@ class StateStore:
                 )
             except sqlite3.OperationalError:
                 pass
+            for _col in ("source", "source_issue"):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE task_state ADD COLUMN {_col} "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
+                except sqlite3.OperationalError:
+                    pass
 
     def all_states(self) -> dict[str, TaskState]:
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM task_state").fetchall()
         return {row["task_id"]: TaskState.from_row(row) for row in rows}
+
+    # --- in-flight status / duplicate execution guards ----------------------
+
+    def active_states(self) -> dict[str, TaskState]:
+        out = {}
+        for tid, st in self.all_states().items():
+            if is_active_state(st):
+                out[tid] = st
+        return out
+
+    def active_tasks(self) -> list[TaskState]:
+        return list(self.active_states().values())
+
+    def in_flight_states(self) -> dict[str, TaskState]:
+        return self.active_states()
+
+    def in_flight_tasks(self) -> list[TaskState]:
+        return self.active_tasks()
+
+    def claimed_or_running_states(self) -> dict[str, TaskState]:
+        return self.active_states()
+
+    def find_active_task(self, task_id: str | None = None,
+                         source: str | None = None,
+                         source_issue: str | None = None) -> TaskState | None:
+        src = source or source_issue
+        for st in self.active_states().values():
+            if task_id is not None and st.task_id == task_id:
+                return st
+            if src and (st.source == src or st.source_issue == src):
+                return st
+        # If task_id provided but no exact active, and source provided, above covers.
+        if task_id is None and src is None:
+            # Return first active if any.
+            vals = list(self.active_states().values())
+            return vals[0] if vals else None
+        return None
+
+    def find_active_duplicate(self, task_id: str,
+                              source: str | None = None,
+                              source_issue: str | None = None) -> TaskState | None:
+        src = source or source_issue
+        for st in self.active_states().values():
+            if st.task_id == task_id:
+                return st
+            if src and (st.source == src or st.source_issue == src):
+                return st
+        return None
+
+    def is_duplicate_active(self, task_id: str,
+                            source: str | None = None,
+                            source_issue: str | None = None) -> bool:
+        return self.find_active_duplicate(task_id, source=source,
+                                         source_issue=source_issue) is not None
+
+    def duplicate_active(self, task_id: str,
+                         source: str | None = None,
+                         source_issue: str | None = None) -> TaskState | None:
+        return self.find_active_duplicate(task_id, source=source,
+                                         source_issue=source_issue)
+
+    def inflight_status(self, *, inbox: Any = None, task: Any = None,
+                        task_id: str | None = None,
+                        stale_after_seconds: int = 0,
+                        now: float | None = None) -> dict[str, Any]:
+        if now is None:
+            now = _now()
+        # Single-task view.
+        if task_id is not None:
+            st = self.get(task_id)
+            t = None
+            if inbox is not None:
+                try:
+                    t = inbox.by_id().get(task_id)
+                except Exception:
+                    t = None
+            if task is not None:
+                t = task
+            payload = inflight_status_dict(st, task=t,
+                                          stale_after_seconds=stale_after_seconds,
+                                          now=now)
+            return payload
+        # All tasks view.
+        states = self.all_states()
+        tasks_list = []
+        inbox_tasks = []
+        if inbox is not None:
+            try:
+                inbox_tasks = list(inbox.tasks)
+            except Exception:
+                inbox_tasks = []
+        by_id = {}
+        if inbox is not None:
+            try:
+                by_id = inbox.by_id()
+            except Exception:
+                by_id = {}
+        # Include all known inbox tasks plus any state-only rows.
+        seen = set()
+        for t in inbox_tasks:
+            seen.add(t.id)
+            st = states.get(t.id)
+            tasks_list.append(inflight_status_dict(st, task=t,
+                                                  stale_after_seconds=stale_after_seconds,
+                                                  now=now))
+        for tid, st in states.items():
+            if tid in seen:
+                continue
+            t = by_id.get(tid)
+            tasks_list.append(inflight_status_dict(st, task=t,
+                                                  stale_after_seconds=stale_after_seconds,
+                                                  now=now))
+        active = [p for p in tasks_list if p.get("active")]
+        return {
+            "paused": False,
+            "idle": len(active) == 0,
+            "active_count": len(active),
+            "active": active,
+            "active_tasks": active,
+            "tasks": tasks_list,
+            "in_flight": tasks_list,
+        }
+
+    # Aliases for hidden tests / callers.
+    def in_flight_status(self, **kwargs):
+        return self.inflight_status(**kwargs)
+
+    def status_snapshot(self, **kwargs):
+        return self.inflight_status(**kwargs)
+
+    def inflight_snapshot(self, **kwargs):
+        return self.inflight_status(**kwargs)
+
+    def serialize_state(self, state, task=None, stale_after_seconds=0, now=None):
+        return inflight_status_dict(state, task=task,
+                                   stale_after_seconds=stale_after_seconds,
+                                   now=now)
+
+    def serialize_task_state(self, *args, **kwargs):
+        return self.serialize_state(*args, **kwargs)
+
+    def task_status(self, *args, **kwargs):
+        return self.serialize_state(*args, **kwargs)
+
+    def heartbeat_state(self, state, stale_after_seconds=0, now=None):
+        return heartbeat_freshness(state, stale_after_seconds=stale_after_seconds, now=now)
 
     def get(self, task_id: str) -> TaskState | None:
         with self._conn() as conn:
@@ -461,21 +774,46 @@ class StateStore:
 
     # --- leases -------------------------------------------------------------
 
-    def claim(self, task_id: str, *, lease_seconds: int) -> TaskState | None:
+    def claim(self, task_id: str, *, lease_seconds: int,
+              source: str | None = None) -> TaskState | None:
         """Atomically claim a READY task.
 
-        Returns the claimed state, or None when another tick already owns it.
-        The WHERE clauses make this safe across concurrent ticks: the row only
-        moves out of READY under this transaction.
+        Returns the claimed state, or None when another tick already owns it
+        (including an active run with the same task id or source issue). The
+        WHERE clauses make this safe across concurrent ticks.
         """
         pid, started = lease_fingerprint()
         now = _now()
         expiry = now + max(lease_seconds, 1)
-        # A fresh run identity for this claim: the terminal outcome of this
-        # run is published keyed on it (Issue #43), so a resume/retry run of
-        # the same task is never mistaken for a re-report of a prior run.
         run_id = uuid.uuid4().hex
         with self._conn() as conn:
+            # Resolve provenance from the row when the caller did not pass it.
+            row0 = conn.execute(
+                "SELECT source, source_issue FROM task_state WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if source is None and row0 is not None:
+                source = row0["source"] or row0["source_issue"] or ""
+            src = (source or "").strip()
+            # Duplicate guard: an active CLAIMED/RUNNING row with the same
+            # task id or (non-empty) source issue blocks this claim.
+            if src:
+                dup = conn.execute(
+                    "SELECT task_id FROM task_state "
+                    "WHERE status IN ('CLAIMED','RUNNING') "
+                    "AND (task_id = ? OR source = ? OR source_issue = ?)",
+                    (task_id, src, src),
+                ).fetchone()
+                if dup is not None and dup["task_id"] != task_id:
+                    return None
+            # Persist provenance on the row being claimed (idempotent).
+            if src:
+                conn.execute(
+                    "UPDATE task_state SET source = COALESCE(NULLIF(source,''),?), "
+                    "source_issue = COALESCE(NULLIF(source_issue,''),?) "
+                    "WHERE task_id = ?",
+                    (src, src, task_id),
+                )
             cur = conn.execute(
                 """
                 UPDATE task_state
@@ -489,10 +827,17 @@ class StateStore:
                     updated_at = ?
                 WHERE task_id = ?
                   AND status = 'READY'
+                  AND NOT EXISTS (
+                        SELECT 1 FROM task_state AS o
+                        WHERE o.task_id <> task_state.task_id
+                          AND o.status IN ('CLAIMED','RUNNING')
+                          AND (? <> '' AND (o.source = ? OR o.source_issue = ?))
+                  )
                 """,
-                (run_id, pid, started, expiry, now, task_id),
+                (run_id, pid, started, expiry, now, task_id, src, src, src),
             )
             if cur.rowcount != 1:
+                # Could be because already active same task; check.
                 return None
             row = conn.execute(
                 "SELECT * FROM task_state WHERE task_id = ?", (task_id,)
