@@ -31,8 +31,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -135,6 +137,10 @@ class EvidenceBundle:
     validator: str = "verification-gate"
     evidence_reused: bool = False
     fetch_back: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Non-repository artifact contract evidence (Issue #99): store, branch,
+    # commit SHA, deliverable path and content hash from the independent
+    # remote fetch. Empty for ordinary repository tasks.
+    artifact: dict[str, Any] = dataclasses.field(default_factory=dict)
     # Probe target identity: probe evidence must never be reused across
     # different targets or environments (governance B).
     runtime_probe: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -526,6 +532,14 @@ class _Git:
         return record
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class VerificationGate:
     """Runs the risk-tiered verification pass for one task.
 
@@ -551,6 +565,7 @@ class VerificationGate:
         env_extra: dict[str, str] | None = None,
         require_repo: bool = True,
         probe_spec: Any = None,
+        artifact: dict[str, Any] | None = None,
     ):
         task_id = (task_id or "").strip()
         if not task_id:
@@ -584,6 +599,20 @@ class VerificationGate:
         except ValueError as exc:
             self._probe_runner = None
             self._probe_error = str(exc)
+        # Non-repository artifact contract (Issue #99): when set, this gate
+        # verifies the pushed artifact (branch + deliverable + independent
+        # remote fetch) instead of the tier's repository checks. The spec
+        # must be complete (store/branch/deliverable) — a partial spec fails
+        # closed here, mirroring the registry's parse-time contract.
+        self.artifact: dict[str, Any] | None = None
+        self._artifact_record: dict[str, Any] = {}
+        if artifact is not None:
+            if not isinstance(artifact, dict):
+                raise GateError("artifact spec must be a dict")
+            for key in ("store", "branch", "deliverable"):
+                if not str(artifact.get(key) or "").strip():
+                    raise GateError(f"artifact spec is incomplete: missing {key!r}")
+            self.artifact = {str(k): str(v) for k, v in artifact.items()}
 
     # -- evidence discovery ------------------------------------------------
 
@@ -659,6 +688,185 @@ class VerificationGate:
             command=f"test -f {len(changed)} changed paths",
             exit_code=0 if ok else 1,
             output=redact("\n".join(missing)) or "all changed paths present",
+            started_at=started,
+        )
+
+    def check_artifact_verify(self) -> CheckResult:
+        """Non-repository artifact gate (Issue #99).
+
+        For artifact tasks this check IS the required gate: it proves, with
+        independent reads of the remote store, that
+          1. the workspace is on the declared artifact branch,
+          2. the declared deliverable exists as a regular, non-empty file and
+             stays under evidence/ or docs/,
+          3. the local HEAD is pushed to the exact declared remote branch,
+          4. an independent fetch of that remote branch and the exact
+             deliverable matches the local commit SHA and content hash,
+          5. the store's main branch has not moved since checkout (no
+             writes to main).
+        No repository test suite is run for artifact tasks.
+        """
+        from .registry import validate_deliverable
+
+        started = utcnow()
+        spec = self.artifact or {}
+        store = str(spec.get("store", ""))
+        branch = str(spec.get("branch", ""))
+        deliverable = str(spec.get("deliverable", ""))
+        url = str(spec.get("remote_url") or "") or f"https://github.com/{store}.git"
+        main_baseline = str(spec.get("main_baseline_sha") or "")
+
+        record: dict[str, Any] = {
+            "store": store,
+            "branch": branch,
+            "deliverable": deliverable,
+            "method": "ls-remote + independent shallow clone",
+            "independent_remote_read": False,
+        }
+        self._artifact_record = record
+        git = _Git(self.repo_path)
+
+        def fail(reason: str) -> CheckResult:
+            record["error"] = reason
+            return CheckResult(
+                check_id="artifact_verify",
+                status="FAIL",
+                command="artifact-verify",
+                output=reason[:400],
+                evidence_ref=f"artifact:{store}:{branch}:{deliverable}",
+                started_at=started,
+            )
+
+        if not git.is_repo():
+            return fail("artifact workspace is not a git repository")
+
+        code, out = git._run("rev-parse", "--abbrev-ref", "HEAD")
+        current = out.strip() if code == 0 else ""
+        if current != branch:
+            return fail(
+                f"workspace is on branch {current or 'unknown'}; declared "
+                f"artifact branch is {branch!r}"
+            )
+
+        err = validate_deliverable(deliverable)
+        if err:
+            return fail(err)
+        target = self.repo_path / deliverable
+        # Defense in depth: the registry already rejects traversal, but a
+        # crafted workspace tree must not escape the declared prefix either.
+        try:
+            target.resolve().relative_to(self.repo_path.resolve())
+        except (ValueError, OSError):
+            return fail(f"deliverable {deliverable!r} resolves outside the workspace")
+        if target.is_symlink() or not target.is_file():
+            return fail(f"deliverable {deliverable!r} is not a regular file")
+        try:
+            if target.stat().st_size <= 0:
+                return fail(f"deliverable {deliverable!r} is empty")
+        except OSError as exc:
+            return fail(f"deliverable {deliverable!r} is unreadable: {exc}")
+
+        code, out = git._run("rev-parse", "HEAD")
+        local_sha = out.strip() if code == 0 else ""
+        if not local_sha:
+            return fail("cannot resolve local HEAD in the artifact workspace")
+        record["local_sha"] = local_sha
+
+        code, out = git._run("ls-remote", url, f"refs/heads/{branch}", timeout=120)
+        remote_sha = ""
+        if code == 0:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
+                    remote_sha = parts[0]
+                    break
+        if not remote_sha:
+            return fail(
+                f"remote branch {branch!r} of {store} is not published; the "
+                "deliverable commit was not pushed"
+            )
+        record["remote_sha"] = remote_sha
+        if remote_sha != local_sha:
+            return fail(
+                f"local HEAD {local_sha[:12]} does not match remote branch tip "
+                f"{remote_sha[:12]}; commit not pushed to the declared branch"
+            )
+
+        local_hash = _sha256_file(target)
+        record["deliverable_sha256"] = local_hash
+
+        tmp_root = Path(tempfile.mkdtemp(prefix="vg-artifact-"))
+        try:
+            clone_dir = tmp_root / "fetch"
+            code, out = git._run(
+                "clone", "--quiet", "--depth", "1", "--branch", branch,
+                "--", url, str(clone_dir), timeout=300,
+            )
+            if code != 0:
+                return fail(
+                    f"independent fetch of remote branch {branch!r} failed: "
+                    f"{out.strip()[:200]}"
+                )
+            record["independent_remote_read"] = True
+            code, out = _Git(clone_dir)._run("rev-parse", "HEAD")
+            fetched_sha = out.strip() if code == 0 else ""
+            if fetched_sha != remote_sha:
+                return fail(
+                    f"fetch-back HEAD {fetched_sha[:12] or 'unknown'} differs "
+                    f"from remote branch tip {remote_sha[:12]}"
+                )
+            record["fetched_head"] = fetched_sha
+            fetched_file = clone_dir / deliverable
+            if not fetched_file.is_file():
+                return fail(
+                    f"deliverable {deliverable!r} is absent from the "
+                    "independently fetched remote branch"
+                )
+            remote_hash = _sha256_file(fetched_file)
+            record["remote_deliverable_sha256"] = remote_hash
+            if remote_hash != local_hash:
+                return fail(
+                    "independent fetch-back: deliverable content hash mismatch "
+                    f"({local_hash[:12]} != {remote_hash[:12]})"
+                )
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+        code, out = git._run("ls-remote", url, "refs/heads/main", timeout=120)
+        main_now = ""
+        if code == 0:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
+                    main_now = parts[0]
+                    break
+        record["remote_main_sha"] = main_now
+        record["main_baseline_sha"] = main_baseline
+        if not main_baseline:
+            return fail(
+                "no main-branch baseline recorded at checkout; cannot prove "
+                "the artifact store main branch was left untouched"
+            )
+        if main_baseline == "ABSENT":
+            if main_now:
+                return fail(
+                    f"artifact store main branch appeared ({main_now[:12]}); "
+                    "main must stay untouched"
+                )
+        elif main_now != main_baseline:
+            return fail(
+                f"artifact store main branch moved {main_baseline[:12]} -> "
+                f"{main_now[:12]}; no writes to main are allowed"
+            )
+
+        record["ok"] = True
+        return CheckResult(
+            check_id="artifact_verify",
+            status="PASS",
+            command="artifact-verify",
+            exit_code=0,
+            output="artifact verified against an independent remote fetch",
+            evidence_ref=f"artifact:{store}:{branch}:{deliverable}",
             started_at=started,
         )
 
@@ -1019,7 +1227,14 @@ class VerificationGate:
             bundle.changed_files = redact(git.changed_since(bundle.baseline_sha))
         bundle.rollback_ref = rollback_plan[:200]
 
-        required = TIER_CHECKS[self.risk_tier]
+        # Artifact tasks (Issue #99): the artifact check IS the gate. The
+        # tier's repository checks are meaningless for a non-repository
+        # deliverable and must not be run; ordinary repository tasks keep
+        # the risk-tiered set unchanged.
+        if self.artifact is not None:
+            required = ("artifact_verify",)
+        else:
+            required = TIER_CHECKS[self.risk_tier]
         checks: list[CheckResult] = []
         used_reuse = False
 
@@ -1032,6 +1247,7 @@ class VerificationGate:
             ),
             "preconditions": lambda: self.check_preconditions(precondition_plan),
             "rollback_plan": lambda: self.check_rollback_plan(rollback_plan),
+            "artifact_verify": self.check_artifact_verify,
         }
         runners.update(self.custom_checks)
 
@@ -1085,6 +1301,11 @@ class VerificationGate:
 
         bundle.checks = [redact(c.to_dict()) for c in checks]
 
+        # Artifact contract evidence (Issue #99): the Supervisor can
+        # independently fetch store/branch/deliverable from this record.
+        if self.artifact is not None:
+            bundle.artifact = dict(self._artifact_record)
+
         # Record probe identity (target/environment) in the bundle so probe
         # evidence can never be silently reused across a different target.
         for c in checks:
@@ -1117,11 +1338,19 @@ class VerificationGate:
         # A required set that collapsed entirely to "not applicable" is a
         # PASS: there was genuinely nothing to verify for this tier. Any
         # remaining PARTIAL is still fatal (the task is not fully proven).
+        # The collapse only applies to a real repository workspace: a
+        # non-repository prompt-only legacy task must stay PARTIAL
+        # (non-accepted), never falsely pass (Issue #99).
         not_applicable = {
             c.check_id for c in checks if c.status == "PARTIAL" and c.reused is False and
             c.skip_reason.startswith("not applicable")
         }
-        if raw_verdict == "PARTIAL" and not_applicable and set(missing_required) <= not_applicable:
+        if (
+            raw_verdict == "PARTIAL"
+            and not_applicable
+            and set(missing_required) <= not_applicable
+            and git.is_repo()
+        ):
             bundle.skipped = [
                 f"{c['check_id']}: {c.get('skip_reason', 'n/a')}"
                 for c in bundle.checks
@@ -1134,7 +1363,12 @@ class VerificationGate:
         bundle.validator = "verification-gate"
 
         # fetch-back verification (governance section 9)
-        if git.is_repo():
+        if self.artifact is not None:
+            # The artifact check already performed the independent remote
+            # read (ls-remote + shallow clone); the generic GitHub
+            # fetch-back is not run on top of it.
+            bundle.fetch_back = dict(self._artifact_record)
+        elif git.is_repo():
             bundle.fetch_back = git.fetch_verify("HEAD")
 
         # persist cache so the next pass can reuse PASS evidence.

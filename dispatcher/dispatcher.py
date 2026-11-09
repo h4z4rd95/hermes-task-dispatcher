@@ -95,6 +95,23 @@ class Dispatcher:
             self._router = SessionRouter(logger=self.log)
         return self._router
 
+    def _task_router(self, workdir: Path) -> Any:
+        """The router for one task run, anchored at the declared workdir.
+
+        A checked-out task (repository or non-repository artifact, Issue
+        #99) runs inside its workspace; a prompt-only legacy task keeps the
+        historical home-directory behaviour. The same router instance is
+        reused for idle-recovery continuations, and the workdir is re-pinned
+        on every run — session continuation re-claims the same recorded
+        workspace path, so the workdir is stable across resumes.
+        """
+        router = self.router
+        try:
+            router.workdir = workdir
+        except (AttributeError, TypeError):
+            pass
+        return router
+
     @property
     def workspace(self):
         if self._workspace is None:
@@ -577,6 +594,8 @@ class Dispatcher:
         self.log("info", f"{task.id}: claiming → RUNNING (attempt {state.attempts})")
         checkout_path: Path | None = None
         task_baseline_sha = ""
+        remote_main_baseline = ""
+        remote_url_override = ""
         if task.needs_checkout:
             checkout = self.workspace.checkout(
                 task_id=task.id,
@@ -604,6 +623,34 @@ class Dispatcher:
             except Exception as exc:
                 self.log("warn", f"{task.id}: baseline rev-parse failed: {exc}")
                 task_baseline_sha = ""
+        elif task.is_artifact_task:
+            # Non-repository artifact task (Issue #99): an isolated
+            # branch workspace cloned from the declared artifact store.
+            # The store's main-branch SHA at clone time is the "no writes
+            # to main" baseline the verification gate checks against.
+            checkout = self.workspace.checkout_artifact(
+                task_id=task.id,
+                store=task.artifact_store,
+                branch=task.artifact_branch,
+                purpose=task.purpose or task.title,
+                keep=task.keep_workspace,
+                task_budget_mb=task.workspace_budget_mb,
+            )
+            checkout_path = checkout.path
+            state.workspace_path = str(checkout_path)
+            state.session_id = state.session_id or ""
+            self.store.upsert(state)
+            remote_main_baseline = str(getattr(checkout, "remote_main_sha", "") or "")
+            remote_url_override = str(getattr(checkout, "remote_url", "") or "")
+            try:
+                _base = subprocess.run(
+                    ["git", "-C", str(checkout_path), "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                task_baseline_sha = _base.stdout.strip() if _base.returncode == 0 else ""
+            except Exception as exc:
+                self.log("warn", f"{task.id}: artifact baseline rev-parse failed: {exc}")
+                task_baseline_sha = ""
 
         try:
             prompt = task.resolved_prompt(self.cfg.control_repo)
@@ -612,6 +659,27 @@ class Dispatcher:
                                summary=f"prompt resolution failed: {exc}")
             report.errors.append(f"{task.id}: {exc}")
             return
+
+        if task.is_artifact_task:
+            # Explicit contract for the executing agent: the deliverable
+            # path, the isolated branch, and the no-writes-to-main rule.
+            # Without this note the agent would not know where its durable
+            # output must land or that pushing is part of the contract.
+            prompt = (
+                prompt
+                + "\n\n[DISPATCHER ARTIFACT WORKSPACE]\n"
+                + f"You are executing inside the task workspace at {checkout_path}. "
+                + f"It is a checkout of artifact store {task.artifact_store} on "
+                + f"isolated branch {task.artifact_branch}.\n"
+                + f"Write the deliverable to {task.deliverable} (a regular file "
+                + "under evidence/ or docs/), commit it, and push to the exact "
+                + f"remote branch {task.artifact_branch}.\n"
+                + "Do not create, push to, or modify the store's main/master "
+                + "branch. The dispatcher verifies the pushed artifact by "
+                + "independently fetching the remote branch and the "
+                + "deliverable; the task cannot become DONE until that "
+                + "verification passes."
+            )
 
         session_name = task.session or f"dispatcher-{task.id}"
         if state.attempts > 1:
@@ -691,7 +759,12 @@ class Dispatcher:
                 "monitor_interval_s": self.cfg.monitor_interval_s,
                 "max_idle_recoveries": self.cfg.max_idle_recoveries,
             })
-        run = self.router.run(**run_kwargs)
+        # The task executes in its declared checkout/workspace directory
+        # (repository or non-repository artifact); prompt-only legacy tasks
+        # keep the home-directory behaviour. The same workdir is preserved
+        # across session continuation and idle recovery (Issue #99).
+        workdir = checkout_path if checkout_path is not None else self.cfg.home
+        run = self._task_router(workdir).run(**run_kwargs)
         state.session_id = run.session_id
         self.store.upsert(state)
         if checkout_path is not None and run.session_id:
@@ -766,10 +839,27 @@ class Dispatcher:
         gate_status = "PASS"
         gate_bundle_path = ""
         gate_summary = ""
+        artifact_evidence: dict[str, Any] = {}
         # Effective tier from the registry contract: declared tier clamped
         # UP to the policy floor. Never silently downgraded.
         gate_tier = task.effective_risk_tier
         checkout_root = checkout_path or self.cfg.home
+        # Artifact tasks (Issue #99) are gated by the artifact contract
+        # check, not by repository checks: the deliverable is a durable
+        # file in a separate store, pushed to an isolated branch.
+        gate_branch = task.branch
+        require_repo = task.needs_checkout
+        artifact_spec: dict[str, str] | None = None
+        if task.is_artifact_task:
+            gate_branch = task.artifact_branch
+            require_repo = False
+            artifact_spec = {
+                "store": task.artifact_store,
+                "branch": task.artifact_branch,
+                "deliverable": task.deliverable,
+                "remote_url": remote_url_override,
+                "main_baseline_sha": remote_main_baseline,
+            }
         # Build the runtime probe from the task's allowlisted probe spec.
         # Malformed or unknown probes yield BLOCKED (fail closed), never DONE.
         probe = build_probe(
@@ -787,12 +877,14 @@ class Dispatcher:
                 criteria=list(getattr(task, "acceptance_criteria", []) or []),
                 cache_path=self.cfg.state_dir / "verification_cache.json",
                 baseline_sha=task_baseline_sha,
-                branch=task.branch,
-                # Only tasks that actually check out a repository are gated on
-                # repository-based checks. Prompt-only tasks (no repo) run with
-                # require_repo=False so their checks degenerate to
-                # not-applicable instead of blocking DONE.
-                require_repo=task.needs_checkout,
+                branch=gate_branch,
+                # Only tasks that actually check out a repository are gated
+                # on repository-based checks. Prompt-only tasks (no repo)
+                # run with require_repo=False so their checks degenerate to
+                # not-applicable PARTIAL — which, since Issue #99, does NOT
+                # collapse to PASS (non-accepted, never falsely done).
+                require_repo=require_repo,
+                artifact=artifact_spec,
             )
             gate_bundle = gate.run(
                 probe=probe,
@@ -801,6 +893,7 @@ class Dispatcher:
                 rollback_plan=str(getattr(task, "rollback_plan", "") or ""),
             )
             gate_status = gate_bundle.status
+            artifact_evidence = dict(getattr(gate_bundle, "artifact", {}) or {})
             gate_bundle_path = (
                 str(self.cfg.state_dir / f"verification-{task.id}.json")
             )
@@ -842,10 +935,41 @@ class Dispatcher:
         ]
         if checkout_path is not None:
             evidence.append({"kind": "workspace", "path": str(checkout_path)})
+        if task.is_artifact_task:
+            # Structured artifact evidence (Issue #99): the Supervisor can
+            # independently fetch store/branch/deliverable and compare the
+            # exact commit SHA and content hash from this record.
+            evidence.append({
+                "kind": "artifact",
+                "store": task.artifact_store,
+                "branch": task.artifact_branch,
+                "deliverable": task.deliverable,
+                "commit_sha": str(artifact_evidence.get("remote_sha") or ""),
+                "deliverable_sha256": str(artifact_evidence.get("deliverable_sha256") or ""),
+                "remote_main_sha": str(artifact_evidence.get("remote_main_sha") or ""),
+                "main_baseline_sha": str(artifact_evidence.get("main_baseline_sha") or ""),
+                "independent_remote_read": bool(
+                    artifact_evidence.get("independent_remote_read")
+                ),
+                "gate": gate_status,
+            })
         # Partial work must remain in the task workspace after an
         # interruption/failure; only a verified DONE run may auto-commit it.
         commit_sha = ""
-        if status == "DONE":
+        if status == "DONE" and task.is_artifact_task:
+            # The verified remote branch tip is the authoritative commit:
+            # the agent already committed and pushed the deliverable, and
+            # the artifact gate fetched it back independently. Never
+            # auto-commit on top of a verified SHA.
+            commit_sha = str(artifact_evidence.get("remote_sha") or "")
+            if not commit_sha:
+                self.log(
+                    "error",
+                    f"{task.id}: artifact gate passed without a verified "
+                    "remote SHA; refusing DONE",
+                )
+                status = "FAILED"
+        if status == "DONE" and not task.is_artifact_task:
             try:
                 commit_sha = self._maybe_task_commit(task)
             except Exception as exc:
@@ -1010,6 +1134,24 @@ class Dispatcher:
 
     # --- control repo reporting ---------------------------------------------
 
+    @staticmethod
+    def _ledger_evidence(state) -> list:
+        """Structured outcome evidence persisted with the terminal release.
+
+        Only artifact tasks (Issue #99) publish their evidence list into
+        the control-repo ledger, so the Supervisor can independently
+        fetch store/branch/deliverable from the line; ordinary tasks keep
+        the historical ledger shape (empty evidence) byte-for-byte.
+        """
+        try:
+            outcome = json.loads(state.outcome_json or "{}")
+        except (TypeError, ValueError):
+            return []
+        ev = outcome.get("evidence") if isinstance(outcome, dict) else None
+        if not isinstance(ev, list):
+            return []
+        return [dict(e) for e in ev if isinstance(e, dict)]
+
     def _write_outcomes_to_control(self, inbox: Inbox, report: TickReport) -> str | None:
         """Update terminal task statuses in the inbox TOML + append the JSONL ledger."""
         states = self.store.all_states()
@@ -1038,7 +1180,9 @@ class Dispatcher:
                     task_id=task.id,
                     status=state.status,
                     summary=state.outcome_summary or "",
-                    evidence=(),
+                    evidence=self._ledger_evidence(state)
+                    if task.is_artifact_task
+                    else (),
                     commit_sha=state.commit_sha or "",
                     # Key the ledger line on the run (Issue #43): a
                     # resume/retry run of the same task reaching the same

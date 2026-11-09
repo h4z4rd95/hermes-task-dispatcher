@@ -193,18 +193,32 @@ def derive_manifest(
     source = "declared"
     if actual:
         source = "declared+actual"
-    if not task.repo and not writes and not reads and not shared:
+    repo = task.repo
+    branch = task.branch
+    if task.is_artifact_task:
+        # Non-repository artifact task (Issue #99): its real write surface
+        # is the artifact store on its isolated branch (the task's own repo
+        # field is empty by contract). The deliverable is a declared write,
+        # and the store+branch pair is a shared mutable resource, so two
+        # artifact tasks on the same branch always serialize.
+        repo = task.artifact_store
+        branch = task.artifact_branch
+        writes.add(task.deliverable.strip("/"))
+        shared.add(normalize_shared_resource(
+            f"branch:{task.artifact_store}:{task.artifact_branch}"
+        ))
+    if not repo and not writes and not reads and not shared:
         source = "none"
-    unscoped = bool(task.repo) and not writes and not actual and not declared_w
-    contracts = classify_contracts(task.repo, writes) | classify_contracts(task.repo, reads)
+    unscoped = bool(repo) and not writes and not actual and not declared_w
+    contracts = classify_contracts(repo, writes) | classify_contracts(repo, reads)
     body = {
-        "task_id": task.id, "repo": task.repo, "branch": task.branch,
+        "task_id": task.id, "repo": repo, "branch": branch,
         "baseline_sha": baseline_sha or "", "w": sorted(writes),
         "r": sorted(reads), "s": sorted(shared), "c": sorted(contracts),
         "unscoped": unscoped,
     }
     return ResourceManifest(
-        task_id=task.id, repo=task.repo, branch=task.branch,
+        task_id=task.id, repo=repo, branch=branch,
         baseline_sha=baseline_sha or "",
         write_paths=frozenset(writes), read_paths=frozenset(reads),
         shared_resources=frozenset(shared), contracts=frozenset(contracts),

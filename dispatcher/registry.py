@@ -22,6 +22,9 @@ __all__ = [
     "load_inbox",
     "task_to_toml_block",
     "inbox_to_toml",
+    "validate_artifact_store",
+    "validate_artifact_branch",
+    "validate_deliverable",
 ]
 
 # Task states. Terminal states stop the dispatcher from re-claiming a task.
@@ -37,11 +40,93 @@ SESSION_AFFINITY = ("dedicated", "existing", "none")
 RISK_TIERS_ALLOWED = ("T0", "T1", "T2", "T3")
 RISK_TIER_POLICY_FLOOR = "T1"
 
+# --- Non-repository artifact metadata (Issue #99) ---------------------------
+# A task with an empty target repo may declare a durable artifact store
+# (owner/repository slug), an isolated non-main artifact branch, and the
+# exact deliverable path. The three fields form one contract: present
+# together or not at all. Validation fails closed — a partial or
+# contradictory declaration is an invalid task, and the dispatcher must
+# never silently fall back to a home-directory workspace for it.
+_ARTIFACT_STORE_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_ARTIFACT_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
+_FORBIDDEN_BRANCH_COMPONENTS = frozenset({"main", "master", "head", ".", "..", ""})
+_ARTIFACT_DELIVERABLE_PREFIXES = ("evidence/", "docs/")
+_ARTIFACT_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def validate_artifact_store(value: str) -> str:
+    """Return an error message for an artifact store slug, or '' when valid."""
+    v = (value or "").strip()
+    if not v:
+        return "artifact_store is required with artifact metadata"
+    if not _ARTIFACT_STORE_RE.match(v):
+        return f"artifact_store {v!r} is not a valid 'owner/repository' slug"
+    return ""
+
+
+def validate_artifact_branch(value: str) -> str:
+    """Return an error message for an artifact branch name, or '' when valid.
+
+    The branch must be safe and non-main: never main/master/head, no
+    traversal (..) or dot components, no option-like leading dash, no
+    empty or duplicated separators, no ``.lock`` suffix.
+    """
+    v = (value or "").strip()
+    if not v:
+        return "artifact_branch is required with artifact metadata"
+    if v.lower() in _FORBIDDEN_BRANCH_COMPONENTS:
+        return f"artifact_branch {v!r} must not be a default/main branch"
+    if not _ARTIFACT_BRANCH_RE.match(v):
+        return f"artifact_branch {v!r} is not a safe branch name"
+    if v.endswith("/") or "//" in v or v.endswith(".lock") or v.endswith(".LOCK"):
+        return f"artifact_branch {v!r} is not a safe branch name"
+    for comp in v.split("/"):
+        if comp.lower() in _FORBIDDEN_BRANCH_COMPONENTS:
+            return f"artifact_branch {v!r} contains a forbidden component {comp!r}"
+        if comp.startswith(".") or comp.startswith("-"):
+            return f"artifact_branch {v!r} contains an unsafe component {comp!r}"
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", comp):
+            return f"artifact_branch {v!r} contains an unsafe component {comp!r}"
+    return ""
+
+
+def validate_deliverable(value: str) -> str:
+    """Return an error message for an artifact deliverable path, or '' when valid.
+
+    The deliverable must be a safe relative path under ``evidence/`` or
+    ``docs/``: absolute paths, backslashes, traversal, empty, dot-like or
+    option-like components are all rejected.
+    """
+    v = (value or "").strip()
+    if not v:
+        return "deliverable is required with artifact metadata"
+    if v.startswith("/") or "\\" in v or v.startswith("-"):
+        return f"deliverable {v!r} must be a safe relative path"
+    if v.startswith("evidence/"):
+        rel = v[len("evidence/"):]
+    elif v.startswith("docs/"):
+        rel = v[len("docs/"):]
+    else:
+        return f"deliverable {v!r} must live under 'evidence/' or 'docs/'"
+    if not rel:
+        return f"deliverable {v!r} must name a file under the artifact directory"
+    for comp in rel.split("/"):
+        if (comp in ("", ".", "..") or comp.startswith(".")
+                or comp.startswith("-")):
+            return f"deliverable {v!r} contains an unsafe path component {comp!r}"
+        if not _ARTIFACT_COMPONENT_RE.match(comp):
+            return f"deliverable {v!r} contains an unsafe path component {comp!r}"
+    return ""
+
 _INT_FIELDS = {"priority", "workspace_budget_mb", "max_retries", "timeout_seconds"}
 _STR_FIELDS = {
     "id", "title", "status", "workstream", "repo", "branch", "prompt_path",
     "prompt_inline", "session", "session_affinity", "model", "approval_note",
     "purpose", "result_note", "risk_tier", "source",
+    # Non-repository artifact contract (Issue #99): optional, explicit
+    # metadata. The three artifact_* fields form one contract — present
+    # together or not at all — and are only legal with an empty repo.
+    "task_class", "project", "artifact_store", "artifact_branch", "deliverable",
 }
 _DICT_FIELDS = {"runtime_probe"}
 _BOOL_FIELDS = {"parallel_safe", "keep_workspace", "requires_approval",
@@ -88,6 +173,15 @@ class Task:
     write_paths: list[str] = field(default_factory=list)
     read_paths: list[str] = field(default_factory=list)
     shared_resources: list[str] = field(default_factory=list)
+    # Non-repository artifact contract (Issue #99): optional, explicit
+    # metadata for tasks with an empty target repo. All three artifact_*
+    # fields must be present together; validate() fails closed otherwise.
+    # task_class / project are provenance labels carried to the ledger.
+    task_class: str = ""
+    project: str = ""
+    artifact_store: str = ""
+    artifact_branch: str = ""
+    deliverable: str = ""
     max_retries: int = 2
     timeout_seconds: int = 1500
     model: str = ""
@@ -143,6 +237,25 @@ class Task:
                 errs.append(
                     f"risk_tier {self.risk_tier!r} not in {list(RISK_TIERS_ALLOWED)}"
                 )
+        if self.repo and (
+            self.artifact_store or self.artifact_branch or self.deliverable
+        ):
+            errs.append(
+                "artifact metadata is only allowed when the target repo is empty"
+            )
+        if self.artifact_store or self.artifact_branch or self.deliverable:
+            for name, value, validator in (
+                ("artifact_store", self.artifact_store, validate_artifact_store),
+                ("artifact_branch", self.artifact_branch,
+                 validate_artifact_branch),
+                ("deliverable", self.deliverable, validate_deliverable),
+            ):
+                if not value:
+                    errs.append(f"artifact metadata incomplete: {name} is missing")
+                else:
+                    error = validator(value)
+                    if error:
+                        errs.append(error)
         return errs
 
 
@@ -170,6 +283,16 @@ class Task:
     @property
     def needs_checkout(self) -> bool:
         return bool(self.repo)
+
+    @property
+    def is_artifact_task(self) -> bool:
+        """True when a complete non-repository artifact contract is declared.
+
+        validate() guarantees the three artifact fields are either all
+        present (and individually safe) or all absent, so this is never
+        partially true on a valid task.
+        """
+        return bool(self.artifact_store and self.artifact_branch and self.deliverable)
 
     def resolved_prompt(self, control_repo: Path) -> str:
         """Return the prompt text, loading prompt_path from the control repo."""
@@ -432,7 +555,8 @@ def load_inbox(path: Path) -> Inbox:
 # --- serialization (deterministic, diffable) --------------------------------
 
 _ORDER = (
-    "id", "title", "status", "priority", "workstream", "repo", "branch",
+    "id", "title", "status", "priority", "workstream", "task_class", "project",
+    "repo", "branch", "artifact_store", "artifact_branch", "deliverable",
     "purpose", "prompt_path", "prompt_inline", "session", "session_affinity",
     "parallel_safe", "workspace_budget_mb", "keep_workspace", "requires_approval",
     "approval_note", "dependencies", "write_paths", "read_paths",
@@ -476,7 +600,9 @@ def task_to_toml_block(task: Task) -> str:
             continue
         value = data[key]
         # Keep the block tight: skip empty/opted-out fields we never serialize.
-        if key in ("prompt_path", "prompt_inline", "purpose", "model", "result_note", "risk_tier") and not value:
+        if key in ("prompt_path", "prompt_inline", "purpose", "model",
+                   "result_note", "risk_tier", "task_class", "project",
+                   "artifact_store", "artifact_branch", "deliverable") and not value:
             continue
         if key == "runtime_probe" and not value:
             continue

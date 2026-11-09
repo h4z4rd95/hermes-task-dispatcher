@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from .registry import validate_artifact_branch, validate_artifact_store
+
 __all__ = [
     "WorkspaceError",
     "WorkspaceQuotaError",
@@ -84,6 +86,12 @@ class Checkout:
     path: Path
     created: bool  # False when a valid recorded checkout was reused
     size_bytes: int
+    # Remote identity (Issue #99, artifact workspaces): the clone URL and
+    # the store's main-branch SHA at checkout time (the "no writes to main"
+    # baseline for the verification gate; "ABSENT" when the store has no
+    # main branch). Empty for ordinary repository checkouts (unchanged).
+    remote_url: str = ""
+    remote_main_sha: str = ""
 
 
 def _now() -> float:
@@ -136,12 +144,18 @@ class WorkspaceManager:
         logger: logging.Logger | None = None,
         git_timeout_s: int = 600,
         api_timeout_s: int = 15,
+        remote_urls: dict[str, str] | None = None,
     ) -> None:
         self.pool_root = Path(pool_root)
         self.global_quota_mb = int(global_quota_mb)
         self.github_token = github_token
         self.git_timeout_s = git_timeout_s
         self.api_timeout_s = api_timeout_s
+        # Optional per-store clone-URL overrides (Issue #99): maps an
+        # artifact-store slug to a non-GitHub clone URL (e.g. a local bare
+        # remote in tests). Only artifact clones consult this map; ordinary
+        # repository checkouts always use https://github.com/<repo>.git.
+        self.remote_urls: dict[str, str] = dict(remote_urls or {})
         self._log = logger or logging.getLogger("dispatcher.workspace")
         self._lock = threading.RLock()
         self._records: list[dict[str, Any]] = []
@@ -285,14 +299,24 @@ class WorkspaceManager:
 
     # ------------------------------------------------------------ git plumbing
 
-    def _git(self, args: Sequence[str], *, cwd: Path) -> subprocess.CompletedProcess:
+    def _git_rc(
+        self, args: Sequence[str], *, cwd: Path
+    ) -> tuple[int, str, str]:
+        """Run git without raising on a non-zero exit.
+
+        Returns ``(returncode, stdout, stderr)``. This is the single
+        subprocess seam of the manager: ``_git`` re-raises non-zero exits as
+        :class:`WorkspaceError`, while callers that need to *distinguish a
+        missing ref from a broken environment* (artifact-branch probing) use
+        this directly and fail closed on any transport error.
+        """
         cmd = ["git", *args]
         self._log.debug("git %s (cwd=%s)", " ".join(args), cwd)
         try:
-            return subprocess.run(
+            proc = subprocess.run(
                 cmd,
                 cwd=str(cwd),
-                check=True,
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=self.git_timeout_s,
@@ -300,12 +324,25 @@ class WorkspaceManager:
         except subprocess.TimeoutExpired as exc:
             raise WorkspaceError(f"git {' '.join(args)} timed out") from exc
         except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or str(exc.stdout or "")).strip()
-            raise WorkspaceError(
-                f"git {' '.join(args)} failed: {detail}"
-            ) from exc
+            # check=False never raises this for real subprocess.run, but a
+            # patched transport (tests) or a race can still surface it:
+            # convert it to a non-zero exit so callers fail closed.
+            return int(exc.returncode or 1), (exc.stdout or ""), (exc.stderr or "")
         except OSError as exc:
             raise WorkspaceError(f"git {' '.join(args)} failed: {exc}") from exc
+        return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+    def _git(self, args: Sequence[str], *, cwd: Path) -> subprocess.CompletedProcess:
+        """Run git and raise :class:`WorkspaceError` on any non-zero exit."""
+        rc, out, err = self._git_rc(args, cwd=cwd)
+        if rc != 0:
+            detail = (err or out).strip()
+            raise WorkspaceError(
+                f"git {' '.join(args)} failed: {detail}"
+            )
+        return subprocess.CompletedProcess(
+            args=["git", *list(args)], returncode=0, stdout=out, stderr=""
+        )
 
     def _clone(self, *, repo: str, branch: str, path: Path,
                shallow: bool, depth: int) -> None:
@@ -332,6 +369,20 @@ class WorkspaceManager:
             self._log.warning(
                 "preserving dirty workspace for task recovery at %s; skipping reset",
                 path,
+            )
+            return
+
+        # An unpublished non-main branch (the artifact case: created locally
+        # from main and not yet pushed) has no origin/<branch> ref to measure
+        # divergence against. Preserve the local work instead of erroring.
+        rc, _out, _err = self._git_rc(
+            ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+            cwd=path,
+        )
+        if rc != 0:
+            self._log.debug(
+                "origin/%s not published yet for %s; preserving local work",
+                branch, path,
             )
             return
 
@@ -474,6 +525,190 @@ class WorkspaceManager:
             "checked out %s (%d bytes) for task %s", path, record["size_bytes"], task_id
         )
         return Checkout(path=path, created=True, size_bytes=record["size_bytes"])
+
+    def checkout_artifact(
+        self,
+        *,
+        task_id: str,
+        store: str,
+        branch: str,
+        purpose: str = "",
+        keep: bool = False,
+        task_budget_mb: int = 0,
+        depth: int = 1,
+        remote_url: str | None = None,
+    ) -> Checkout:
+        """Clone (or reuse) an isolated artifact-store workspace.
+
+        Non-repository tasks declare a durable artifact store (owner/repo
+        slug) and an isolated non-main branch. The workspace is cloned from
+        the store; the declared branch is checked out directly from the
+        remote when it already exists, and otherwise created locally from
+        the store's ``main`` branch. Main/master is never checked out for
+        writes, pushed, or reset.
+
+        Reuse semantics match :meth:`checkout`: a recorded checkout with a
+        valid git directory is reused with ``created=False``; dirty or
+        locally-ahead work is preserved for continuation, and only a clean,
+        un-ahead checkout against a *published* branch is refreshed. The
+        store's main-branch SHA at clone time is recorded in
+        :attr:`Checkout.remote_main_sha` (``"ABSENT"`` when the store has no
+        main branch) — the verification gate's no-writes-to-main baseline.
+        """
+        if not task_id or not _safe_component(task_id) or _safe_component(
+            task_id
+        ) != task_id:
+            raise WorkspaceError(
+                f"invalid task_id (must be a single safe path component): {task_id!r}"
+            )
+        store_err = validate_artifact_store(store)
+        if store_err:
+            raise WorkspaceError(store_err)
+        branch_err = validate_artifact_branch(branch)
+        if branch_err:
+            raise WorkspaceError(branch_err)
+        self._ensure()
+
+        path = self._path_for(task_id, store, branch)
+        url = (
+            remote_url
+            or self.remote_urls.get(store)
+            or f"https://github.com/{store}.git"
+        )
+
+        # Fast path: reuse a recorded, still-valid checkout.
+        with self._lock:
+            self._load()
+            record = self._find(task_id, store, branch)
+            if record is not None:
+                recorded_path = Path(record["path"])
+                if self._valid_checkout(recorded_path):
+                    self._sync(recorded_path, branch)
+                    record["last_use"] = _now()
+                    record["policy"] = (
+                        POLICY_KEEP if keep else record.get("policy", POLICY_RECLAIM)
+                    )
+                    self._save()
+                    self._log.debug("reused artifact workspace %s for %s", recorded_path, task_id)
+                    return Checkout(
+                        path=recorded_path,
+                        created=False,
+                        size_bytes=int(record.get("size_bytes") or 0),
+                        remote_url=str(record.get("remote_url") or url),
+                        remote_main_sha=str(record.get("remote_main_sha") or ""),
+                    )
+                # Stale record (dir gone / not a git repo). The path is still
+                # metadata-owned, so removing the leftover is within the
+                # safety invariants; then fall through to a fresh clone.
+                self._log.debug("discarding invalid artifact record for %s", task_id)
+                if recorded_path.exists():
+                    shutil.rmtree(recorded_path, ignore_errors=True)
+                self._records.remove(record)
+                self._save()
+
+            # Never silently clobber an unmanaged directory (same hard safety
+            # fence as checkout()).
+            if path.exists():
+                raise WorkspaceError(
+                    f"refusing to clone over existing unmanaged path: {path}"
+                )
+
+        # Re-check just before cloning (outside the lock): another process
+        # may have created the path while we were measuring quota.
+        if path.exists():
+            raise WorkspaceError(
+                f"refusing to clone over existing unmanaged path: {path}"
+            )
+
+        # Quota gate BEFORE cloning. Fail closed on every violation.
+        size_bytes = self._check_quota(repo=store, task_budget_mb=task_budget_mb)
+
+        # Does the declared branch already exist on the remote?
+        rc, out, _err = self._git_rc(
+            ["ls-remote", "--heads", url, branch], cwd=self.pool_root
+        )
+        if rc != 0:
+            raise WorkspaceError(
+                f"cannot probe artifact store {store} for branch {branch!r}; "
+                f"git ls-remote failed"
+            )
+        remote_branch_published = any(
+            len(line.split()) == 2
+            and re.fullmatch(r"[0-9a-f]{40}", line.split()[0])
+            and line.split()[1] == f"refs/heads/{branch}"
+            for line in out.splitlines()
+        )
+
+        with self._lock:
+            depth_arg = str(max(1, int(depth)))
+            if remote_branch_published:
+                # Branch already published: check it out directly.
+                self._git(
+                    ["clone", "--quiet", "--depth", depth_arg,
+                     "--single-branch", "--branch", branch,
+                     "--", url, str(path)],
+                    cwd=self.pool_root,
+                )
+            else:
+                # Branch not published yet: clone main and create the
+                # declared local branch from it. Never write to main.
+                try:
+                    self._git(
+                        ["clone", "--quiet", "--depth", depth_arg,
+                         "--single-branch", "--branch", "main",
+                         "--", url, str(path)],
+                        cwd=self.pool_root,
+                    )
+                except WorkspaceError as exc:
+                    shutil.rmtree(path, ignore_errors=True)
+                    raise WorkspaceError(
+                        f"cannot clone artifact store {store}: the store has "
+                        f"no main branch to create {branch!r} from: {exc}"
+                    ) from exc
+                self._git(["checkout", "--quiet", "-b", branch], cwd=path)
+            # Independent read of the store's main-branch SHA (the
+            # no-writes-to-main baseline). "ABSENT" is a valid state.
+            rc, out, _err = self._git_rc(
+                ["ls-remote", url, "refs/heads/main"], cwd=self.pool_root
+            )
+            main_sha = ""
+            if rc == 0:
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
+                        main_sha = parts[0]
+                        break
+            measured = self._measure(path)
+            now = _now()
+            record = {
+                "path": str(path),
+                "task_id": task_id,
+                "repo": store,
+                "branch": branch,
+                "purpose": purpose,
+                "size_bytes": measured or size_bytes,
+                "last_use": now,
+                "created_at": now,
+                "policy": POLICY_KEEP if keep else POLICY_RECLAIM,
+                "session_id": "",
+                "artifact": True,
+                "remote_url": url,
+                "remote_main_sha": main_sha or "ABSENT",
+            }
+            self._records.append(record)
+            self._save()
+
+        self._log.info(
+            "checked out artifact workspace %s (%d bytes) for task %s on %s",
+            path, record["size_bytes"], task_id, branch,
+        )
+        return Checkout(
+            path=path,
+            created=True,
+            size_bytes=record["size_bytes"],
+            remote_url=url,
+            remote_main_sha=record["remote_main_sha"],
+        )
 
     def _check_quota(self, *, repo: str, task_budget_mb: int) -> int:
         """Verify the repo fits every configured bound; return its size in bytes."""

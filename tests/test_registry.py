@@ -253,3 +253,152 @@ def test_spawned_by_source_value_parses():
             "source = \"spawned-by:T-48\"\n")
     task = parse_inbox(text).tasks[0]
     assert task.source == "spawned-by:T-48"
+
+
+# --- Issue #99: non-repository artifact metadata -----------------------------
+#
+# The three artifact_* fields form ONE contract: present together, with an
+# empty repo, or absent. Missing or contradictory declarations must fail
+# closed at parse time — never silently fall back to the Hermes home.
+
+ARTIFACT_BLOCK = """\
+[[task]]
+id = "T-ART"
+title = "Artifact dispatch"
+status = "READY"
+prompt_inline = "write the report into the declared deliverable"
+task_class = "CODE"
+project = "Hermes Task Dispatcher"
+artifact_store = "h4z4rd95/evidence-store"
+artifact_branch = "work/evidence-2026-11-08"
+deliverable = "evidence/report-2026-11-08.md"
+"""
+
+
+def _parse_artifact_block(drop: tuple[str, ...] = ()) -> Task:
+    """Parse ARTIFACT_BLOCK, optionally dropping whole artifact lines."""
+    text = ARTIFACT_BLOCK
+    lines = {
+        "artifact_store = ": "artifact_store = \"h4z4rd95/evidence-store\"\n",
+        "artifact_branch = ": "artifact_branch = \"work/evidence-2026-11-08\"\n",
+        "deliverable = ": "deliverable = \"evidence/report-2026-11-08.md\"\n",
+    }
+    for prefix in drop:
+        text = text.replace(lines[prefix], "")
+    return parse_inbox(text).tasks[0]
+
+
+def test_artifact_task_parses_with_full_metadata():
+    task = _parse_artifact_block()
+    assert task.is_artifact_task is True
+    assert task.needs_checkout is False
+    assert task.repo == ""
+    assert task.artifact_store == "h4z4rd95/evidence-store"
+    assert task.artifact_branch == "work/evidence-2026-11-08"
+    assert task.deliverable == "evidence/report-2026-11-08.md"
+    assert task.task_class == "CODE"
+    assert task.project == "Hermes Task Dispatcher"
+
+
+def test_task_class_and_project_are_optional_labels():
+    text = (ARTIFACT_BLOCK.replace('task_class = "CODE"\n', "")
+                       .replace('project = "Hermes Task Dispatcher"\n', ""))
+    task = parse_inbox(text).tasks[0]
+    # Provenance labels are optional; the artifact contract still holds.
+    assert task.task_class == ""
+    assert task.project == ""
+    assert task.is_artifact_task is True
+
+
+@pytest.mark.parametrize("drop", [
+    ("artifact_store = ",),
+    ("artifact_branch = ",),
+    ("deliverable = ",),
+])
+def test_partial_artifact_metadata_rejected(drop):
+    with pytest.raises(InboxError, match="artifact"):
+        _parse_artifact_block(drop=drop)
+
+
+def test_artifact_metadata_rejected_with_repo():
+    text = ARTIFACT_BLOCK + 'repo = "owner/alpha"\n'
+    with pytest.raises(InboxError, match="artifact"):
+        parse_inbox(text)
+
+
+@pytest.mark.parametrize("store", [
+    "owner",                      # no slash
+    "owner/repo/extra",           # extra component
+    "own er/repo",                # space
+    "../owner/repo",              # traversal
+    "owner/repo?x=1",             # query-like
+])
+def test_artifact_store_must_be_owner_repo_slug(store):
+    text = ARTIFACT_BLOCK.replace(
+        'artifact_store = "h4z4rd95/evidence-store"',
+        f'artifact_store = "{store}"')
+    with pytest.raises(InboxError, match="artifact_store"):
+        parse_inbox(text)
+
+
+@pytest.mark.parametrize("branch", [
+    "main",
+    "master",
+    "MAIN",
+    "work/main",           # forbidden component
+    "work/../main",        # traversal
+    "work//evidence",      # duplicated separator
+    "work/evidence/",      # trailing slash
+    "work/evidence.lock",  # lock suffix
+    "-c",                  # option-like
+    "--all",               # option-like
+    "work/.hidden",        # dot component
+])
+def test_artifact_branch_must_be_safe_non_main(branch):
+    text = ARTIFACT_BLOCK.replace(
+        'artifact_branch = "work/evidence-2026-11-08"',
+        f'artifact_branch = "{branch}"')
+    with pytest.raises(InboxError, match="artifact_branch"):
+        parse_inbox(text)
+
+
+@pytest.mark.parametrize("deliverable", [
+    "report-2026-11-08.md",      # not under evidence/ or docs/
+    "evidence/",                 # no file
+    "evidence/../etc/passwd",    # traversal
+    "evidence/sub/.hidden.md",   # dot component
+    "evidence/-flag.md",         # option-like component
+    "/evidence/report.md",       # absolute
+    "evidence\\report.md",       # backslash
+])
+def test_deliverable_must_be_safe_relative_path(deliverable):
+    text = ARTIFACT_BLOCK.replace(
+        'deliverable = "evidence/report-2026-11-08.md"',
+        f'deliverable = "{deliverable}"')
+    with pytest.raises(InboxError, match="deliverable"):
+        parse_inbox(text)
+
+
+def test_docs_deliverable_is_accepted():
+    text = ARTIFACT_BLOCK.replace(
+        'deliverable = "evidence/report-2026-11-08.md"',
+        'deliverable = "docs/ops/runbook-2026-11-08.md"')
+    task = parse_inbox(text).tasks[0]
+    assert task.deliverable == "docs/ops/runbook-2026-11-08.md"
+
+
+def test_artifact_fields_roundtrip_toml():
+    task = _parse_artifact_block()
+    block = task_to_toml_block(task)
+    assert 'artifact_store = "h4z4rd95/evidence-store"' in block
+    assert 'artifact_branch = "work/evidence-2026-11-08"' in block
+    assert 'deliverable = "evidence/report-2026-11-08.md"' in block
+    parsed = parse_inbox(block).tasks[0]
+    assert parsed.is_artifact_task is True
+    assert parsed.artifact_store == task.artifact_store
+    # A plain task serialises without any artifact keys.
+    plain = Task(id="T-PLAIN", title="x", prompt_inline="p")
+    plain_block = task_to_toml_block(plain)
+    assert "artifact_" not in plain_block
+    assert "deliverable" not in plain_block
+    assert plain.is_artifact_task is False

@@ -117,6 +117,38 @@ class FakeControl:
         return "commit-sha"
 
 
+# --- gate stub -------------------------------------------------------------- #
+# Issue #99 made the verification gate the sole gate for DONE (artifact tasks
+# get their artifact check; prompt-only legacy tasks stay PARTIAL /
+# non-accepted). These governance tests exercise admission, leases and
+# concurrency, not the gate — stub it to PASS where a DONE status is the
+# point under test.
+
+class _PassGateBundle:
+    status = "PASS"
+    checks = []
+    details = ""
+    evidence_reused = 0
+    blockers = []
+    artifact = {}
+
+    def write(self, path):
+        return None
+
+
+class _PassGate:
+    def __init__(self, **kwargs):
+        pass
+
+    def run(self, **kwargs):
+        return _PassGateBundle()
+
+
+def _stub_pass_gate(monkeypatch):
+    monkeypatch.setattr("dispatcher.dispatcher.build_probe", lambda **kwargs: None)
+    monkeypatch.setattr("dispatcher.dispatcher.VerificationGate", _PassGate)
+
+
 def _make_config(tmp_path: Path, *, max_concurrent: int = 2) -> Config:
     control = tmp_path / "control"
     (control / "hermes").mkdir(parents=True, exist_ok=True)
@@ -141,12 +173,20 @@ def _make_config(tmp_path: Path, *, max_concurrent: int = 2) -> Config:
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
     cfg = _make_config(tmp_path)
     store = StateStore(cfg.state_db)
     router = FakeRouter()
     workspace = FakeWorkspace()
     control = FakeControl()
+    # No-network contract of this file: admit every declared repo under a
+    # deterministic baseline HEAD instead of probing GitHub (artifact tasks,
+    # repo == "", are not probed by admission anyway).
+    from dispatcher.scheduling import SchedulingAdmitter
+    monkeypatch.setattr(
+        SchedulingAdmitter, "refresh_remote_head",
+        lambda self, task, state, control=None: ("b" * 40) if task.repo else None,
+    )
     d = Dispatcher(cfg, store=store, router=router, workspace=workspace, control=control)
     return d, cfg, store, router, workspace, control
 
@@ -175,7 +215,8 @@ def test_unknown_dependency_is_fail_closed_at_parse():
     assert "unknown task" in str(exc.value)
 
 
-def test_dependency_not_done_blocks_claim_until_done(env):
+def test_dependency_not_done_blocks_claim_until_done(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control = env
     dep = Task(id="T-A", title="dep", prompt_inline="p")
     child = Task(id="T-B", title="child", prompt_inline="p",
@@ -268,7 +309,8 @@ def test_max_concurrent_caps_claims_per_tick(tmp_path):
 # --- stale RUNNING lease recovery ----------------------------------------------
 
 
-def test_stale_lease_recovered_and_runs_exactly_once(env):
+def test_stale_lease_recovered_and_runs_exactly_once(env, monkeypatch):
+    _stub_pass_gate(monkeypatch)
     d, cfg, store, router, workspace, control = env
     _write_inbox(cfg.control_repo, [
         Task(id="T-STALE", title="stale", prompt_inline="p", max_retries=1)])
@@ -344,12 +386,19 @@ def test_gate_crash_fails_closed(monkeypatch, env):
 
 
 def test_done_only_with_gate_pass(env):
+    """The gate is still the sole gate for DONE. Since Issue #99 a
+    prompt-only legacy task (no repo, no artifact metadata) can no longer
+    reach DONE at all — its gate is PARTIAL / non-accepted. (Repo tasks keep
+    their tier checks; artifact tasks are gated by the artifact check — see
+    tests/test_artifact_e2e.py.)"""
     d, cfg, store, router, workspace, control = env
     _write_inbox(cfg.control_repo, [Task(id="T-OK", title="ok", prompt_inline="p")])
     d.tick()
-    assert store.get("T-OK").status == "DONE"
-    assert control.written[0]["status"] == "DONE"
-    assert control.written[0]["reason"] == ""
+    assert store.get("T-OK").status != "DONE"
+    assert store.get("T-OK").status == "FAILED"
+    assert control.written[0]["status"] == "FAILED"
+    assert "gate=PARTIAL" in control.written[0]["summary"] or \
+        "gate=PARTIAL" in str(control.written[0])
 
 
 # --- workspace / project isolation ----------------------------------------------
