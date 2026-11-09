@@ -741,3 +741,46 @@ def test_workdir_persists_across_fresh_and_resumed_runs():
     assert calls[0]["cwd"] == workdir
     cmd = calls[0]["cmd"]
     assert cmd[cmd.index("--in") + 1] == str(workdir)
+
+
+# ---- empty-session recovery (Issue #112) ----
+
+def test_empty_located_session_is_quarantined_and_fresh(monkeypatch):
+    """A located session with 0 messages must be quarantined and a fresh one created."""
+    runner = FakeRunner(stdout=FRESH_STDOUT, session_exists=True)
+    router = make_router(runner)
+    monkeypatch.setattr(router, "_session_message_count", lambda name: 0)
+    quarantined = []
+    monkeypatch.setattr(router, "_quarantine_empty_session", lambda name: quarantined.append(name))
+    res = router.run(session_name="smoke-1", prompt="hi")
+    assert quarantined == ["smoke-1"]
+    # After quarantine, session_exists becomes False -> fresh create path.
+    assert res.session_id == "20261005_031844_e29272"
+    # --run-budget never sent
+    chat_calls = [c for c in runner.calls if "chat" in c["cmd"]]
+    assert chat_calls
+    for c in chat_calls:
+        assert "--run-budget" not in c["cmd"]
+
+
+def test_nonempty_located_session_is_resumed(monkeypatch):
+    """A located session with messages is resumed normally (no quarantine)."""
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=True)
+    router = make_router(runner)
+    monkeypatch.setattr(router, "_session_message_count", lambda name: 5)
+    quarantined = []
+    monkeypatch.setattr(router, "_quarantine_empty_session", lambda name: quarantined.append(name))
+    res = router.run(session_name="smoke-1", prompt="hi")
+    assert quarantined == []
+    assert res.resumed is True
+
+
+def test_message_count_unknown_keeps_resume(monkeypatch):
+    """If message count cannot be determined, keep existing resume behaviour."""
+    runner = FakeRunner(stdout=RESUME_STDOUT, session_exists=True)
+    router = make_router(runner)
+    monkeypatch.setattr(router, "_session_message_count", lambda name: None)
+    quarantined = []
+    monkeypatch.setattr(router, "_quarantine_empty_session", lambda name: quarantined.append(name))
+    res = router.run(session_name="smoke-1", prompt="hi")
+    assert quarantined == []

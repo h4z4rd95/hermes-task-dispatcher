@@ -326,6 +326,85 @@ class SessionRouter:
             self._log(f"session db title lookup failed: {exc}")
             return None
 
+    def _session_message_count(self, session_name: str) -> int | None:
+        """Return the message_count of the most recent session with this title.
+
+        Returns None if the database cannot be read (fail-safe: caller keeps
+        existing resume behaviour). Returns 0 when the title exists but has no
+        usable user/assistant messages.
+        """
+        import sqlite3
+
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        db = os.path.join(home, "state.db")
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT COALESCE(message_count, 0) FROM sessions "
+                    "WHERE title = ? ORDER BY started_at DESC LIMIT 1",
+                    (session_name,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return int(row[0] or 0)
+            finally:
+                con.close()
+        except Exception as exc:
+            self._log(f"session db message-count lookup failed: {exc}")
+            return None
+
+    def _session_id_for_title(self, session_name: str) -> str | None:
+        """Return the session id of the most recent session with this title."""
+        import sqlite3
+
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        db = os.path.join(home, "state.db")
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT id FROM sessions WHERE title = ? "
+                    "ORDER BY started_at DESC LIMIT 1",
+                    (session_name,),
+                ).fetchone()
+                return str(row[0]) if row else None
+            finally:
+                con.close()
+        except Exception as exc:
+            self._log(f"session db id lookup failed: {exc}")
+            return None
+
+    def _quarantine_empty_session(self, session_name: str) -> None:
+        """Rename an existing-but-empty session so its title is free.
+
+        An empty located session makes Hermes print
+        "Session locator found but has no messages. Starting fresh." and exit
+        non-zero. Renaming frees the title so the next run creates a genuinely
+        fresh session under the original name.
+        """
+        sid = self._session_id_for_title(session_name)
+        if not sid:
+            return
+        quarantine = f"{session_name}-empty-{int(time.time())}"
+        try:
+            proc = self._runner(
+                [self._bin, "sessions", "rename", sid, quarantine],
+                cwd=self.workdir,
+                env=self._child_env(),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode != 0:
+                self._log(
+                    f"quarantine rename {sid} -> {quarantine!r} "
+                    f"exit={proc.returncode}: "
+                    f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(f"quarantine rename failed: {exc}")
+
     # ------------------------------------------------------------------ #
     # Run
     # ------------------------------------------------------------------ #
@@ -369,6 +448,13 @@ class SessionRouter:
         # is a creation-only override; omitting it on a resume is the root-cause
         # fix for the Oct-31 resume failure (Issue #64).
         session_exists = self.session_name_exists(session_name)
+        if session_exists and self._session_message_count(session_name) == 0:
+            self._log(
+                f"session={session_name!r} located but has no usable messages; "
+                "quarantining empty session and creating a fresh one"
+            )
+            self._quarantine_empty_session(session_name)
+            session_exists = False
         is_fresh = not bool(session_exists)
 
         cmd = self._build_cmd(
