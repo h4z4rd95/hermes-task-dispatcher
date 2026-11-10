@@ -78,13 +78,13 @@ unset _CANDIDATE_PY
 # plan-project-situation-main beside the Dispatcher runtime home.
 CONTROL_REPO="${CONTROL_REPO_PATH:-}"
 if [ -z "$CONTROL_REPO" ]; then
-  if [ -d "$DISPATCHER_HOME/plan-project-situation-main/.git" ]; then
+  if [ -e "$DISPATCHER_HOME/plan-project-situation-main/.git" ]; then
     CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation-main"
   else
     CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"
   fi
 fi
-if [ ! -d "$CONTROL_REPO/.git" ]; then
+if [ ! -e "$CONTROL_REPO/.git" ]; then
   echo "dispatcher tick blocked: control repo checkout missing at $CONTROL_REPO" >&2
   exit 2
 fi
