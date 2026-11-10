@@ -19,6 +19,7 @@ class DispatcherTickScriptTests(unittest.TestCase):
     def test_missing_selected_checkout_fails_closed(self):
         self.assertIn('if [ ! -e "$CONTROL_REPO/.git" ]; then', SCRIPT)
         self.assertIn("dispatcher tick blocked: control repo checkout missing", SCRIPT)
+        self.assertIn('export DISPATCHER_CONTROL_REPO="$CONTROL_REPO"', SCRIPT)
 
 
 if __name__ == "__main__":

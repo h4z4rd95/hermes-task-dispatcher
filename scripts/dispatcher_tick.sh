@@ -88,6 +88,9 @@ if [ ! -e "$CONTROL_REPO/.git" ]; then
   echo "dispatcher tick blocked: control repo checkout missing at $CONTROL_REPO" >&2
   exit 2
 fi
+# The Dispatcher package resolves its inbox/outcomes/control sync from this
+# environment variable. Keep it aligned with the exact checkout used above.
+export DISPATCHER_CONTROL_REPO="$CONTROL_REPO"
 PREFLIGHT="$CONTROL_REPO/supervisor/intake/resource_manifest_preflight.py"
 if [ ! -f "$PREFLIGHT" ]; then
   echo "dispatcher tick blocked: Supervisor resource-manifest preflight is not installed" >&2
