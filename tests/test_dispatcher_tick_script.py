@@ -1,18 +1,25 @@
 from pathlib import Path
+import unittest
 
 SCRIPT = (Path(__file__).resolve().parents[1] / "scripts" / "dispatcher_tick.sh").read_text()
 
 
-def test_dispatcher_preflight_prefers_dedicated_main_worktree():
-    assert 'CONTROL_REPO_PATH:-' in SCRIPT
-    assert 'plan-project-situation-main/.git' in SCRIPT
-    assert SCRIPT.index('plan-project-situation-main/.git') < SCRIPT.index('plan-project-situation"')
+class DispatcherTickScriptTests(unittest.TestCase):
+    def test_preflight_prefers_dedicated_main_worktree(self):
+        self.assertIn("CONTROL_REPO_PATH:-", SCRIPT)
+        self.assertIn("plan-project-situation-main/.git", SCRIPT)
+        self.assertLess(
+            SCRIPT.index("plan-project-situation-main/.git"),
+            SCRIPT.index('CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"'),
+        )
+
+    def test_legacy_checkout_remains_host_fallback(self):
+        self.assertIn('CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"', SCRIPT)
+
+    def test_missing_selected_checkout_fails_closed(self):
+        self.assertIn('if [ ! -d "$CONTROL_REPO/.git" ]; then', SCRIPT)
+        self.assertIn("dispatcher tick blocked: control repo checkout missing", SCRIPT)
 
 
-def test_dispatcher_preflight_preserves_legacy_checkout_as_host_fallback():
-    assert 'CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"' in SCRIPT
-
-
-def test_dispatcher_preflight_fails_closed_when_selected_checkout_is_missing():
-    assert 'if [ ! -d "$CONTROL_REPO/.git" ]; then' in SCRIPT
-    assert 'dispatcher tick blocked: control repo checkout missing' in SCRIPT
+if __name__ == "__main__":
+    unittest.main()
