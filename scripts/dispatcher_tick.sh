@@ -71,11 +71,26 @@ unset _CANDIDATE_PY
 # Dispatcher cron tick, before the normal claim loop. It uses the existing
 # control-repo checkout and A2A Supervisor; no second queue/cron/service.
 # Missing or failed preflight blocks this tick (fail closed).
-CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"
-if [ ! -d "$CONTROL_REPO/.git" ]; then
+# Prefer a dedicated clean main worktree for Supervisor preflight. The
+# normal issue-intake checkout may intentionally remain on a feature branch
+# while a webhook recovery PR is being developed; never switch or overwrite it.
+# Hosts may override this path explicitly. The migration server provisions
+# plan-project-situation-main beside the Dispatcher runtime home.
+CONTROL_REPO="${CONTROL_REPO_PATH:-}"
+if [ -z "$CONTROL_REPO" ]; then
+  if [ -e "$DISPATCHER_HOME/plan-project-situation-main/.git" ]; then
+    CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation-main"
+  else
+    CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"
+  fi
+fi
+if [ ! -e "$CONTROL_REPO/.git" ]; then
   echo "dispatcher tick blocked: control repo checkout missing at $CONTROL_REPO" >&2
   exit 2
 fi
+# The Dispatcher package resolves its inbox/outcomes/control sync from this
+# environment variable. Keep it aligned with the exact checkout used above.
+export DISPATCHER_CONTROL_REPO="$CONTROL_REPO"
 PREFLIGHT="$CONTROL_REPO/supervisor/intake/resource_manifest_preflight.py"
 if [ ! -f "$PREFLIGHT" ]; then
   echo "dispatcher tick blocked: Supervisor resource-manifest preflight is not installed" >&2
