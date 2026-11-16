@@ -9,8 +9,7 @@
 # copy is copied verbatim onto each host. All host differences are env vars.
 set -uo pipefail
 
-# Gateway transport preserves the task cwd and freezes creation policy once.
-# Set to 0 for rollback on a host whose CLI has not qualified stream-json.
+# Qualified gateway transport preserves cwd and frozen resume policy.
 export DISPATCHER_HERMES_STREAM_JSON="${DISPATCHER_HERMES_STREAM_JSON:-1}"
 
 # FIX 2026-10-12 (T-2026-10-12-HERMES-AUTOMATION-READINESS-001):
@@ -61,13 +60,13 @@ cd "$DISPATCHER_HOME"
 # The server runtime ships its own venv; other hosts use PATH.
 # Prefer the canonical Hermes interpreter (py3.14); fall back to the legacy
 # 0.19.0 venv, then PATH python.
-_CANDIDATE_PY="/root/.hermes/tools/python-3.14.7+202****0901-linux-x64/bin/python3"
+_CANDIDATE_PY="$(command -v python3 || true)"
 if [ -x "$_CANDIDATE_PY" ]; then
   PY="${DISPATCHER_PYTHON:-$_CANDIDATE_PY}"
 elif [ -x "/usr/local/lib/hermes-agent/venv/bin/python" ]; then
   PY="${DISPATCHER_PYTHON:-/usr/local/lib/hermes-agent/venv/bin/python}"
 else
-  PY="${DISPATCHER_PYTHON:-python}"
+  PY="${DISPATCHER_PYTHON:-python3}"
 fi
 unset _CANDIDATE_PY
 
@@ -75,11 +74,26 @@ unset _CANDIDATE_PY
 # Dispatcher cron tick, before the normal claim loop. It uses the existing
 # control-repo checkout and A2A Supervisor; no second queue/cron/service.
 # Missing or failed preflight blocks this tick (fail closed).
-CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"
-if [ ! -d "$CONTROL_REPO/.git" ]; then
+# Prefer a dedicated clean main worktree for Supervisor preflight. The
+# normal issue-intake checkout may intentionally remain on a feature branch
+# while a webhook recovery PR is being developed; never switch or overwrite it.
+# Hosts may override this path explicitly. The migration server provisions
+# plan-project-situation-main beside the Dispatcher runtime home.
+CONTROL_REPO="${CONTROL_REPO_PATH:-}"
+if [ -z "$CONTROL_REPO" ]; then
+  if [ -e "$DISPATCHER_HOME/plan-project-situation-main/.git" ]; then
+    CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation-main"
+  else
+    CONTROL_REPO="$DISPATCHER_HOME/plan-project-situation"
+  fi
+fi
+if [ ! -e "$CONTROL_REPO/.git" ]; then
   echo "dispatcher tick blocked: control repo checkout missing at $CONTROL_REPO" >&2
   exit 2
 fi
+# The Dispatcher package resolves its inbox/outcomes/control sync from this
+# environment variable. Keep it aligned with the exact checkout used above.
+export DISPATCHER_CONTROL_REPO="$CONTROL_REPO"
 PREFLIGHT="$CONTROL_REPO/supervisor/intake/resource_manifest_preflight.py"
 if [ ! -f "$PREFLIGHT" ]; then
   echo "dispatcher tick blocked: Supervisor resource-manifest preflight is not installed" >&2
