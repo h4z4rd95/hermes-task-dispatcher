@@ -34,3 +34,9 @@ def test_default_transport_remains_compatible(monkeypatch):
     monkeypatch.delenv("DISPATCHER_HERMES_STREAM_JSON", raising=False)
     cmd = build(SessionRouter(), True)
     assert cmd[cmd.index("--format") + 1] == "text"
+
+
+def test_explicit_launcher_works_without_shell_path(monkeypatch):
+    monkeypatch.setenv("HERMES_BIN", "/qualified/runtime/hermes")
+    router = SessionRouter()
+    assert build(router, True)[0] == "/qualified/runtime/hermes"

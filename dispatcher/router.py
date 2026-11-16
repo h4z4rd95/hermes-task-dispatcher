@@ -242,7 +242,7 @@ class SessionRouter:
         self.extra_env = dict(extra_env) if extra_env else {}
         # The CLI exists even when the binary is absent (tests inject a fake);
         # do not resolve eagerly or test fixtures would need a real hermes.
-        self._bin = HERMES_BIN
+        self._bin = os.environ.get("HERMES_BIN") or HERMES_BIN
         self._runner: _Runner = _default_runner
         self._popen_factory = subprocess.Popen
         self._progress_reader = self._read_session_progress
