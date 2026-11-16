@@ -706,7 +706,7 @@ class Dispatcher:
         if _is_recoverable_transport_failure(run):
             retry_available = state.attempts < task.max_retries
             recovery_status = "READY" if retry_available else "FAILED"
-            interruption_summary = _truncate(run.stdout.strip(), 800)
+            interruption_summary = _owner_summary(run.stdout)
             reason = (
                 "recoverable transport interruption; retry scheduled"
                 if retry_available
@@ -828,7 +828,7 @@ class Dispatcher:
         else:  # FAIL or PARTIAL: never DONE without PASS
             status = "FAILED"
 
-        summary = _truncate(run.stdout.strip(), 800)
+        summary = _owner_summary(run.stdout)
         if gate_summary:
             summary = (summary + "\n[gate] " + gate_summary)[:1100]
         evidence = [
@@ -1228,3 +1228,21 @@ def _default_logger():
         print(f"[dispatcher:{level}] {message}", file=stream)
 
     return log
+
+
+def _owner_summary(raw: str) -> str:
+    """Forward the final gateway result; full tool records remain in private session logs."""
+    result = None
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            result = event
+    if result is not None:
+        text = str(result.get("text") or result.get("error") or "No final result text")
+        sid = str(result.get("session_id") or "")
+        suffix = ("\nSession: " + sid) if sid else ""
+        return _truncate(text.strip(), 800 - len(suffix)) + suffix
+    return _truncate(raw.strip(), 800)
