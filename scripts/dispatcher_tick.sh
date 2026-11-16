@@ -11,6 +11,7 @@ set -uo pipefail
 
 # Qualified gateway transport preserves cwd and frozen resume policy.
 export DISPATCHER_HERMES_STREAM_JSON="${DISPATCHER_HERMES_STREAM_JSON:-1}"
+export DISPATCHER_MAX_IDLE_RECOVERIES="${DISPATCHER_MAX_IDLE_RECOVERIES:-1}"
 if [ -z "${HERMES_BIN:-}" ] && [ -x /usr/local/src/hermes-agent/.hermes/bin/hermes ]; then
   export HERMES_BIN=/usr/local/src/hermes-agent/.hermes/bin/hermes
 fi
