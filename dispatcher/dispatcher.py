@@ -848,6 +848,8 @@ class Dispatcher:
         if status == "DONE":
             try:
                 commit_sha = self._maybe_task_commit(task)
+                if not commit_sha:
+                    commit_sha = _verified_agent_commit(gate_bundle)
             except Exception as exc:
                 # A task is not DONE until its workspace commit is pushed.
                 # Keep the same workspace/session and retry within the task's
@@ -895,6 +897,8 @@ class Dispatcher:
         if not commit_sha:
             latest_state = self.store.get(task.id)
             commit_sha = latest_state.commit_sha if latest_state else ""
+        if commit_sha:
+            summary += "\nCommit: " + commit_sha
         self.store.release(
             task.id,
             status=status,
@@ -1246,3 +1250,17 @@ def _owner_summary(raw: str) -> str:
         suffix = ("\nSession: " + sid) if sid else ""
         return _truncate(text.strip(), 800 - len(suffix)) + suffix
     return _truncate(raw.strip(), 800)
+
+
+def _verified_agent_commit(bundle) -> str:
+    """Recover an agent-pushed SHA only from the independent verification proof."""
+    fetch = getattr(bundle, "fetch_back", {}) or {}
+    sha = str(getattr(bundle, "final_sha", "") or "")
+    if (getattr(bundle, "status", "") == "PASS"
+            and getattr(bundle, "changed_files", [])
+            and fetch.get("ok") is True
+            and fetch.get("independent_remote_read") is True
+            and fetch.get("remote_sha") == fetch.get("local_sha") == sha
+            and len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)):
+        return sha
+    return ""
