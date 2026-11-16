@@ -248,6 +248,8 @@ class SessionRouter:
         self._progress_reader = self._read_session_progress
         self._force_idle_watchdog = False
         self.supports_idle_watchdog = True
+        # Opt in only after qualifying the installed gateway transport.
+        self.stream_json = os.environ.get("DISPATCHER_HERMES_STREAM_JSON", "").lower() in {"1", "true", "yes"}
 
     # ------------------------------------------------------------------ #
     # Test seam
@@ -781,7 +783,7 @@ class SessionRouter:
         if _FORMAT_TEXT_SUPPORTED is None:
             _set_format_text_supported(_cli_supports_format_text(self._bin))
         if _FORMAT_TEXT_SUPPORTED:
-            cmd += ["--format", "text"]
+            cmd += ["--format", "stream-json" if self.stream_json else "text"]
         if new_cli:
             cmd += ["--query-file", "-"]
         else:
@@ -791,9 +793,9 @@ class SessionRouter:
             if new_cli:
                 cmd += ["--in", str(self.workdir)]
             # v0.19.x has no --in; the child inherits the dispatcher's cwd.
-        if model:
+        if model and (is_fresh or not self.stream_json):
             cmd += ["--model", model]
-        if max_turns is not None:
+        if max_turns is not None and (is_fresh or not self.stream_json):
             cmd += ["--max-turns", str(int(max_turns))]
         # NB: --run-budget is deliberately NEVER sent (v0.22.x, 2026-11-03 fix).
         # The CLI's own _resolve_continue_arg turns `-c <name> --create-if-missing`

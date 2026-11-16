@@ -9,6 +9,10 @@
 # copy is copied verbatim onto each host. All host differences are env vars.
 set -uo pipefail
 
+# Gateway transport preserves the task cwd and freezes creation policy once.
+# Set to 0 for rollback on a host whose CLI has not qualified stream-json.
+export DISPATCHER_HERMES_STREAM_JSON="${DISPATCHER_HERMES_STREAM_JSON:-1}"
+
 # FIX 2026-10-12 (T-2026-10-12-HERMES-AUTOMATION-READINESS-001):
 #   The gateway systemd unit ships no EnvironmentFile, so cron children never
 #   inherit GITHUB_TOKEN and the control-repo fetch fails authentication. Load
